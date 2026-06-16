@@ -59,3 +59,61 @@ def plot_power_spectrum(frequencies, spectrum, title=""):
         plt.title(title)
         plt.tight_layout()
         plt.savefig('results/'+title+'.png')
+
+def plot_gc_evolution(times, gc_values, change_point=None, title=""):
+        plt.figure(figsize=(10, 4))
+        plt.plot(times, gc_values, linewidth=2)
+
+        if change_point is not None:
+                plt.axvline(change_point, linestyle="--")
+        
+        plt.xlabel("Time")
+        plt.ylabel("GC")
+        plt.title(title)
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig('results/'+title+'.png')
+
+def plot_true_vs_estimated_gc(times, true_coupling, gc_times, gc_values):
+        plt.figure(figsize=(10, 5))
+        plt.plot(true_coupling, label="True Coupling")
+        plt.plot(gc_times, gc_values, label="Sliding GC")
+        plt.xlabel("Time")
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig('results/True vs Estimated GC.png')
+
+def plot_adaptive_coupling(true_coupling, estimated_coupling, order):
+        plt.figure(figsize=(10, 5))
+        plt.plot(true_coupling, label="True")
+        plt.plot(estimated_coupling, label="RLS Estimate")
+        plt.xlabel("Time")
+        plt.ylabel("Coupling")
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig('results/Adaptive coupling with order '+str(order)+'.png')
+
+def plot_parameter_convergence(history, row, col, title=""):
+        values = history[:, row, col]
+        plt.figure(figsize=(8, 4))
+        plt.plot(values)
+        plt.title(title)
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig('results/'+title+'.png')
+
+def plot_gc_surface(gc_surface, frequencies):
+        plt.figure(figsize=(10, 6))
+        plt.imshow(
+                gc_surface.T, 
+                aspect="auto", 
+                origin="lower",
+                extent=[0, gc_surface.shape[0], frequencies[0]/np.pi, frequencies[-1]/np.pi])
+        plt.colorbar(label="GC")
+        plt.xlabel("Time")
+        plt.ylabel("Frequency (x pi)")
+        plt.title("Adaptive Spectral GC")
+        plt.tight_layout()
+        plt.savefig('results/Adaptive Spectral GC.png')
