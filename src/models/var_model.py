@@ -6,9 +6,13 @@ class VARModel:
         self.coef_matrices = None
         self.residual_covariance = None
         self.residuals = None
+        self.n_vars = None
+        self.n_samples = None
 
     def fit(self, data):
         T, n_vars = data.shape
+        self.n_vars = n_vars
+        self.n_samples = T
         p = self.order
         Y = data[p:]
         X = []
