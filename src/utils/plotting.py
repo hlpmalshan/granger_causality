@@ -117,3 +117,66 @@ def plot_gc_surface(gc_surface, frequencies):
         plt.title("Adaptive Spectral GC")
         plt.tight_layout()
         plt.savefig('results/Adaptive Spectral GC.png')
+
+def plot_spectrum_comparison(
+        frequencies,
+        spectrum_1,
+        spectrum_2,
+        label_1="Spectrum 1",
+        label_2="Spectrum 2",
+        title=""
+):
+        spectrum_1 = np.asarray(spectrum_1)
+        spectrum_2 = np.asarray(spectrum_2)
+
+        # Normalize both spectra for shape comparison.
+        # Raw amplitudes may differ because parametric and multitaper
+        # estimators use different scaling conventions.
+        spectrum_1_norm = spectrum_1 / np.max(spectrum_1)
+        spectrum_2_norm = spectrum_2 / np.max(spectrum_2)
+
+        plt.figure(figsize=(9, 4))
+
+        plt.plot(
+                frequencies / np.pi,
+                spectrum_1_norm,
+                linewidth=2,
+                label=label_1
+        )
+
+        plt.plot(
+                frequencies / np.pi,
+                spectrum_2_norm,
+                linewidth=1,
+                label=label_2
+        )
+
+        plt.xlabel("Normalized frequency (x pi)")
+        plt.ylabel("Normalized power")
+        plt.title(title)
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig('results/'+title+'.png')
+
+def plot_gc_comparison(
+                frequencies,
+                gc_1,
+                gc_2,
+                label_1="GC 1",
+                label_2="GC 2",
+                title=""
+):
+        gc_1 = np.asarray(gc_1)
+        gc_2 = np.asarray(gc_2)
+
+        plt.figure(figsize=(9, 4))
+        plt.plot(frequencies/np.pi, gc_1, linewidth=2, label=label_1)
+        plt.plot(frequencies/np.pi, gc_2, linewidth=2, label=label_2)
+        plt.xlabel("Normalized frequency (x pi)")
+        plt.ylabel("Spectral GC")
+        plt.title(title)
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig('results/'+title+'.png')
