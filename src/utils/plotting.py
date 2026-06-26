@@ -180,3 +180,86 @@ def plot_gc_comparison(
         plt.grid(True)
         plt.tight_layout()
         plt.savefig('results/'+title+'.png')
+
+def plot_latent_vs_fmri(
+                x_neural,
+                y_fmri,
+                channel=0,
+                downsample_factor=10,
+                n_points=500,
+                title=""
+):
+        latent_ds = x_neural[::downsample_factor, channel]
+
+        n = min(n_points, len(latent_ds), len(y_fmri))
+
+        plt.figure(figsize=(10, 4))
+
+        plt.plot(latent_ds[:n], label="Latent neural state downsampled", linewidth=2)
+        plt.plot(y_fmri[:n, channel], label="Observed fMRI-like signal", linewidth=2, linestyle="--")
+
+        plt.xlabel("fMRI sample")
+        plt.ylabel("z-scored activity")
+        plt.title(title)
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig('results/'+title+'.png')
+
+def plot_ssm_smoothing(
+                true_state,
+                observations,
+                smoothed_state,
+                channel=0,
+                n_points=500,
+                title=""
+):
+        
+        n = min(n_points, len(true_state), len(observations), len(smoothed_state))
+
+        plt.figure(figsize=(10, 4))
+        plt.plot(true_state[:n, channel], label="True latent state", linewidth=2)
+        plt.plot(observations[:n, channel], label="Noisy observation", alpha=0.6)
+        plt.plot(smoothed_state[:n, channel], label="Kalman smoothed estimate", linewidth=2, linestyle="--")
+        plt.xlabel("Time")
+        plt.ylabel("Activity")
+        plt.title(title)
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig('results/'+title+'.png')
+
+def plot_em_log_likelihood(log_likelihoods, title=""):
+        plt.figure(figsize=(8, 4))
+        plt.plot(log_likelihoods, marker="o")
+        plt.xlabel("EM iteration")
+        plt.ylabel("Log-likelihood")
+        plt.title(title)
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig('results/'+title+'.png')
+
+def plot_ssm_mixed_observation(true_state, proxy_observation, smoothed_state, channel=0, n_points=500, title=""):
+        n = min(n_points, len(true_state), len(proxy_observation), len(smoothed_state))
+
+        plt.figure(figsize=(10, 4))
+        plt.plot(true_state[:n, channel], label="True latent state", linewidth=2)
+        plt.plot(proxy_observation[:n, channel], label="Pseudo-inverse observation proxy", alpha=0.6)
+        plt.plot(smoothed_state[:n, channel], label="EM smoothed latent estimate", linewidth=2, linestyle="--")
+
+        plt.xlabel("Time")
+        plt.ylabel("Activity")
+        plt.title(title)
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig('results/'+title+'.png')
+
+def plot_method_comparison_bar(labels, values, title="", ylabel="Value"):
+        plt.figure(figsize=(8, 4))
+        plt.bar(labels, values)
+        plt.ylabel(ylabel)
+        plt.title(title)
+        plt.grid(axis="y")
+        plt.tight_layout()
+        plt.savefig('results/'+title+'.png')
