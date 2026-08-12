@@ -1,7 +1,18 @@
 import os
+
+# Each thread handles a complete EM fit. Limiting BLAS threads prevents
+# nested parallelism from multiplying OpenBLAS/MKL worker threads.
+BLAS_THREADS_PER_WORKER = int(
+    os.environ.get("EXPERIMENT_32G_BLAS_THREADS", "1")
+)
+os.environ["OPENBLAS_NUM_THREADS"] = str(BLAS_THREADS_PER_WORKER)
+os.environ["OMP_NUM_THREADS"] = str(BLAS_THREADS_PER_WORKER)
+os.environ["MKL_NUM_THREADS"] = str(BLAS_THREADS_PER_WORKER)
+
 import pickle
 import glob
 import time
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pandas as pd
 
@@ -13,9 +24,10 @@ from src.ssm.ssm_varx_p_simulator import (
     generate_ssm_varx_p_data
 )
 
-from src.ssm.em_varx_p_known_c_l1_mstep import (
-    EMVARXPSSMKnownCConstrainedWarmStartL1Mstep
+from src.ssm.em_varx_p_known_c_l1_mstep_fixed_cov import (
+    EMVARXPSSMKnownCConstrainedWarmStartL1MstepFixedCov
 )
+from src.ssm.em_varx_p_known_c_l1_mstep import NUMBA_AVAILABLE
 
 from src.stats.observed_likelihood_deviance import (
     final_observed_log_likelihood
@@ -29,8 +41,8 @@ from src.stats.scalable_debiased_varx_network import (
 
 
 # ------------------------------------------------------
-# Experiment 32F
-# Row-wise L1 M-step Sparse-A VARX EM
+# Experiment 32G
+# Covariance-controlled row-wise L1 M-step diagnostic
 # ------------------------------------------------------
 
 N_SOURCES = 20
@@ -74,29 +86,42 @@ CUSTOM_THRESHOLDS = (
     25.0
 )
 
-# Finer grid around the useful region from 32E.
-# lambda_A = 0.00 is the no-L1 baseline under the same L1-M-step framework.
+# Small penalties diagnose the abrupt sparsity transition seen in 32F.
 LAMBDA_A_GRID = [
-    0.00,
-    0.001,
-    0.003,
-    0.006,
-    0.010,
-    0.020,
-    0.030
+    0.0,
+    1e-6,
+    3e-6,
+    1e-5,
+    3e-5,
+    1e-4,
+    3e-4,
+    1e-3
 ]
 
+# Four workers is a conservative default for the memory-heavy EM fits.
+# Override explicitly for a particular machine, for example:
+#   $env:EXPERIMENT_32G_WORKERS = "8"
+N_WORKERS = int(
+    os.environ.get(
+        "EXPERIMENT_32G_WORKERS",
+        str(min(4, os.cpu_count() or 1, len(LAMBDA_A_GRID)))
+    )
+)
+
+if N_WORKERS < 1:
+    raise ValueError("EXPERIMENT_32G_WORKERS must be at least 1.")
+
 SHRINKAGE_SPEC = {
-    "name": "QR_0p20",
-    "alpha_Q": 0.20,
-    "alpha_R": 0.20,
+    "name": "fixed_Q0p50_R0p60",
+    "alpha_Q": 0.0,
+    "alpha_R": 0.0,
     "target_Q": "spherical",
     "target_R": "spherical"
 }
 
 
-print("\nExperiment 32F: row-wise L1 M-step sparse-A VARX EM")
-print("----------------------------------------------------")
+print("\nExperiment 32G: covariance-controlled row-wise L1 M-step")
+print("----------------------------------------------------------")
 print("N sources:", N_SOURCES)
 print("Link density:", LINK_DENSITY)
 print("N true links:", N_TRUE_LINKS)
@@ -111,7 +136,10 @@ print("max EM iterations:", MAX_ITER)
 print("tol:", TOL)
 print("debiased ridge lambda:", RIDGE_LAMBDA_DEBIAS)
 print("lambda_A grid:", LAMBDA_A_GRID)
-print("covariance shrinkage:", SHRINKAGE_SPEC["name"])
+print("covariance control:", SHRINKAGE_SPEC["name"])
+print("parallel worker threads:", N_WORKERS)
+print("BLAS threads per worker:", BLAS_THREADS_PER_WORKER)
+print("Numba coordinate descent:", "enabled" if NUMBA_AVAILABLE else "fallback")
 
 
 # ------------------------------------------------------
@@ -742,14 +770,14 @@ def kalman_filter_and_rts_smoother(
 # Model fitting and signal helpers
 # ------------------------------------------------------
 
-def fit_l1_mstep_em_model(
+def fit_l1_mstep_fixed_cov_em_model(
         y_obs,
         u,
         C,
         lambda_A,
         random_seed
 ):
-    model = EMVARXPSSMKnownCConstrainedWarmStartL1Mstep(
+    model = EMVARXPSSMKnownCConstrainedWarmStartL1MstepFixedCov(
         na=na,
         nb=nb,
         C=C,
@@ -764,7 +792,8 @@ def fit_l1_mstep_em_model(
         covariance_floor=1e-6,
         R_init=0.60 * np.eye(N_SOURCES),
         Q_init=0.50 * np.eye(N_SOURCES),
-        estimate_R=True,
+        estimate_Q=False,
+        estimate_R=False,
         R_floor=R_FLOOR,
         zero_constraints=[],
         initial_parameters=None,
@@ -772,7 +801,7 @@ def fit_l1_mstep_em_model(
         random_seed=random_seed,
         verbose=False,
 
-        # Covariance shrinkage from 31G/32A.
+        # Inert while Q/R are fixed; retained for constructor compatibility.
         alpha_Q=SHRINKAGE_SPEC["alpha_Q"],
         alpha_R=SHRINKAGE_SPEC["alpha_R"],
         shrinkage_target_Q=SHRINKAGE_SPEC["target_Q"],
@@ -801,7 +830,7 @@ def fit_l1_mstep_em_model(
         u=u
     )
 
-    model.fit_label = f"l1_mstep_lambda_{lambda_A}"
+    model.fit_label = f"l1_mstep_fixed_cov_lambda_{lambda_A}"
 
     return model
 
@@ -1006,6 +1035,11 @@ def add_metadata(
             )
         )
 
+        df["fixed_Q_trace"] = full_model.fixed_Q_trace
+        df["fixed_R_trace"] = full_model.fixed_R_trace
+        df["estimate_Q"] = full_model.estimate_Q
+        df["estimate_R"] = full_model.estimate_R
+
         df["full_Q_offdiag_mean_abs"] = float(
             np.mean(
                 np.abs(
@@ -1065,6 +1099,10 @@ def add_metadata(
 
         df["full_Q_trace"] = np.nan
         df["full_R_trace"] = np.nan
+        df["fixed_Q_trace"] = np.nan
+        df["fixed_R_trace"] = np.nan
+        df["estimate_Q"] = np.nan
+        df["estimate_R"] = np.nan
         df["full_Q_offdiag_mean_abs"] = np.nan
         df["full_R_offdiag_mean_abs"] = np.nan
 
@@ -1195,6 +1233,10 @@ def summarize_link_strengths(
 
             "mean_full_Q_trace": group["full_Q_trace"].mean(),
             "mean_full_R_trace": group["full_R_trace"].mean(),
+            "mean_fixed_Q_trace": group["fixed_Q_trace"].mean(),
+            "mean_fixed_R_trace": group["fixed_R_trace"].mean(),
+            "mean_estimate_Q": group["estimate_Q"].mean(),
+            "mean_estimate_R": group["estimate_R"].mean(),
             "mean_full_Q_offdiag_abs": group["full_Q_offdiag_mean_abs"].mean(),
             "mean_full_R_offdiag_abs": group["full_R_offdiag_mean_abs"].mean(),
 
@@ -1282,8 +1324,8 @@ def summarize_decision_rules(
 # ------------------------------------------------------
 
 CHECKPOINT_PATH = (
-    "results/"
-    "experiment_32f_l1_mstep_sparse_a_em_checkpoint.pkl"
+    "data/"
+    "experiment_32g_l1_mstep_fixed_covariance_checkpoint.pkl"
 )
 
 CHECKPOINT_REPLACE_ATTEMPTS = 8
@@ -1316,7 +1358,11 @@ def checkpoint_configuration():
         "base_seed": BASE_SEED,
         "custom_thresholds": CUSTOM_THRESHOLDS,
         "lambda_A_grid": LAMBDA_A_GRID,
-        "shrinkage_spec": SHRINKAGE_SPEC
+        "shrinkage_spec": SHRINKAGE_SPEC,
+        "estimate_Q": False,
+        "estimate_R": False,
+        "Q_init_scale": 0.50,
+        "R_init_scale": 0.60
     }
 
 
@@ -1443,14 +1489,14 @@ def load_checkpoint():
 
     if checkpoint is None:
         raise RuntimeError(
-            "Experiment 32F found checkpoint files, but none could be "
+            "Experiment 32G found checkpoint files, but none could be "
             "read. Preserve them for diagnosis and inspect: "
             f"{CHECKPOINT_PATH}*.tmp"
         )
 
     if checkpoint.get("configuration") != checkpoint_configuration():
         raise ValueError(
-            "Experiment 32F checkpoint settings do not match the current "
+            "Experiment 32G checkpoint settings do not match the current "
             "experiment settings. Move or delete the checkpoint before "
             "starting a different configuration: "
             f"{CHECKPOINT_PATH}"
@@ -1463,7 +1509,7 @@ def load_checkpoint():
         checkpoint["true_link_outer_runs"]
     )
 
-    print("\nResuming Experiment 32F from checkpoint:")
+    print("\nResuming Experiment 32G from checkpoint:")
     print(loaded_path)
     print(
         "Completed work units:",
@@ -1489,6 +1535,95 @@ def remove_checkpoint_files():
             print(checkpoint_path)
 
 
+def run_l1_work_unit(task):
+    """Fit and evaluate one lambda value without writing shared outputs."""
+
+    lambda_A = task["lambda_A"]
+    y_obs = task["y_obs"]
+    u = task["u"]
+    C = task["C"]
+    seed = task["seed"]
+
+    print("\n" + "-" * 100)
+    print(f"Fitting fixed-covariance L1-M-step EM with lambda_A={lambda_A}")
+    print("-" * 100)
+
+    full_model = fit_l1_mstep_fixed_cov_em_model(
+        y_obs=y_obs,
+        u=u,
+        C=C,
+        lambda_A=lambda_A,
+        random_seed=seed + 500
+    )
+
+    print("Full LL:", final_observed_log_likelihood(full_model))
+    print("EM iterations:", len(full_model.log_likelihoods))
+    print("Spectral radius:", full_model.spectral_radius())
+    print("Q trace:", float(np.trace(full_model.Q)))
+    print("R trace:", float(np.trace(full_model.R)))
+    print("Nonzero offdiag A:", full_model.count_nonzero_offdiag_A())
+    print("Nonzero total A:", full_model.count_nonzero_total_A())
+    print("Mean abs offdiag A:", full_model.mean_abs_offdiag_A())
+    print("Max abs offdiag A:", full_model.max_abs_offdiag_A())
+
+    if (
+            hasattr(full_model, "lasso_converged_history")
+            and len(full_model.lasso_converged_history) > 0
+    ):
+        print("Lasso converged last:", full_model.lasso_converged_history[-1])
+        print("Lasso mean iterations last:", full_model.lasso_iterations_history[-1])
+        print("Lasso objective last:", full_model.lasso_objective_history[-1])
+
+    posterior = kalman_filter_and_rts_smoother(
+        y=y_obs,
+        u=u,
+        A_matrices=full_model.A_matrices,
+        B_matrices=full_model.B_matrices,
+        Q=full_model.Q,
+        C=C,
+        R=full_model.R
+    )
+
+    signal_specs = [
+        {
+            "signal_type": "em_filtered",
+            "signal": posterior["filtered_x"]
+        },
+        {
+            "signal_type": "em_smoothed",
+            "signal": posterior["smoothed_x"]
+        }
+    ]
+
+    network_dfs = []
+
+    for spec in signal_specs:
+        print(
+            "\nComputing network for:",
+            spec["signal_type"],
+            "lambda_A:",
+            lambda_A
+        )
+
+        network_df = compute_network_for_signal(
+            signal=spec["signal"],
+            u=u,
+            true_link_mask=task["true_link_mask"],
+            signal_type=spec["signal_type"],
+            lambda_A=lambda_A,
+            outer_run=task["outer_run"],
+            random_seed=seed,
+            x_true=task["x_true"],
+            C_diagnostics=task["C_diagnostics"],
+            full_model=full_model,
+            radius_true=task["radius_true"],
+            scale_factor=task["scale_factor"]
+        )
+        network_dfs.append(network_df)
+
+    return float(lambda_A), network_dfs
+
+
 # ------------------------------------------------------
 # Main experiment
 # ------------------------------------------------------
@@ -1503,7 +1638,7 @@ true_link_outer_runs = checkpoint["true_link_outer_runs"]
 for outer_run in range(N_OUTER_RUNS):
 
     print("\n" + "=" * 120)
-    print(f"Experiment 32F | outer run {outer_run + 1}/{N_OUTER_RUNS}")
+    print(f"Experiment 32G | outer run {outer_run + 1}/{N_OUTER_RUNS}")
     print("=" * 120)
 
     seed = BASE_SEED + outer_run
@@ -1628,147 +1763,109 @@ for outer_run in range(N_OUTER_RUNS):
     # L1-M-step EM comparisons
     # --------------------------------------------------
 
-    for lambda_A in LAMBDA_A_GRID:
-
-        unit_key = (
+    pending_l1_tasks = [
+        {
+            "lambda_A": float(lambda_A),
+            "y_obs": y_obs,
+            "u": u,
+            "C": C,
+            "seed": seed,
+            "true_link_mask": true_link_mask,
+            "outer_run": outer_run,
+            "x_true": x_true,
+            "C_diagnostics": C_diagnostics,
+            "radius_true": data["radius_after"],
+            "scale_factor": data["scale_factor"]
+        }
+        for lambda_A in LAMBDA_A_GRID
+        if (
             outer_run,
             "l1_mstep",
             float(lambda_A)
+        ) not in completed_units
+    ]
+
+    skipped_lambdas = len(LAMBDA_A_GRID) - len(pending_l1_tasks)
+
+    if skipped_lambdas > 0:
+        print("\nSkipping completed L1-M-step fits:", skipped_lambdas)
+
+    if pending_l1_tasks:
+        print(
+            "\nRunning",
+            len(pending_l1_tasks),
+            "L1-M-step fits with",
+            min(N_WORKERS, len(pending_l1_tasks)),
+            "worker threads."
         )
 
-        if unit_key in completed_units:
-            print(
-                "\nSkipping completed L1-M-step EM with lambda_A=",
-                lambda_A
-            )
-            continue
-
-        print("\n" + "-" * 100)
-        print(f"Fitting L1-M-step EM with lambda_A={lambda_A}")
-        print("-" * 100)
-
-        full_model = fit_l1_mstep_em_model(
-            y_obs=y_obs,
-            u=u,
-            C=C,
-            lambda_A=lambda_A,
-            random_seed=seed + 500
-        )
-
-        print("Full LL:", final_observed_log_likelihood(full_model))
-        print("EM iterations:", len(full_model.log_likelihoods))
-        print("Spectral radius:", full_model.spectral_radius())
-        print("Nonzero offdiag A:", full_model.count_nonzero_offdiag_A())
-        print("Nonzero total A:", full_model.count_nonzero_total_A())
-        print("Mean abs offdiag A:", full_model.mean_abs_offdiag_A())
-        print("Max abs offdiag A:", full_model.max_abs_offdiag_A())
-
-        if hasattr(full_model, "lasso_converged_history"):
-
-            if len(full_model.lasso_converged_history) > 0:
-                print("Lasso converged last:", full_model.lasso_converged_history[-1])
-                print("Lasso mean iterations last:", full_model.lasso_iterations_history[-1])
-                print("Lasso objective last:", full_model.lasso_objective_history[-1])
-
-        posterior = kalman_filter_and_rts_smoother(
-            y=y_obs,
-            u=u,
-            A_matrices=full_model.A_matrices,
-            B_matrices=full_model.B_matrices,
-            Q=full_model.Q,
-            C=C,
-            R=full_model.R
-        )
-
-        x_em_filtered = posterior["filtered_x"]
-        x_em_smoothed = posterior["smoothed_x"]
-
-        signal_specs = [
-            {
-                "signal_type": "em_filtered",
-                "signal": x_em_filtered
-            },
-            {
-                "signal_type": "em_smoothed",
-                "signal": x_em_smoothed
-            }
-        ]
-
-        for spec in signal_specs:
-
-            print("\nComputing network for:", spec["signal_type"], "lambda_A:", lambda_A)
-
-            network_df = compute_network_for_signal(
-                signal=spec["signal"],
-                u=u,
-                true_link_mask=true_link_mask,
-                signal_type=spec["signal_type"],
-                lambda_A=lambda_A,
-                outer_run=outer_run,
-                random_seed=seed,
-                x_true=x_true,
-                C_diagnostics=C_diagnostics,
-                full_model=full_model,
-                radius_true=data["radius_after"],
-                scale_factor=data["scale_factor"]
+        with ThreadPoolExecutor(
+                max_workers=min(N_WORKERS, len(pending_l1_tasks))
+        ) as executor:
+            work_results = executor.map(
+                run_l1_work_unit,
+                pending_l1_tasks
             )
 
-            all_link_rows.append(
-                network_df
-            )
+            # executor.map yields in lambda-grid order. This preserves the
+            # reference row ordering while later fits run concurrently.
+            for lambda_A, network_dfs in work_results:
+                for network_df in network_dfs:
+                    all_link_rows.append(network_df)
 
-            temp_summary = summarize_decision_rules(
-                network_df
-            )
-
-            temp_display = temp_summary[
-                temp_summary["decision_rule"].isin([
-                    "debiased_chi_detected",
-                    "debiased_fdr_detected",
-                    "debiased_bic_detected",
-                    "debiased_D_gt_10p0_detected",
-                    "debiased_D_gt_15p0_detected",
-                    "debiased_D_gt_20p0_detected",
-                    "debiased_D_gt_25p0_detected"
-                ])
-            ]
-
-            print(
-                temp_display[
-                    [
-                        "signal_type",
-                        "lambda_A",
-                        "decision_rule",
-                        "fpr",
-                        "tpr",
-                        "precision",
-                        "f1",
-                        "tp",
-                        "fp",
-                        "tn",
-                        "fn"
+                    temp_summary = summarize_decision_rules(network_df)
+                    temp_display = temp_summary[
+                        temp_summary["decision_rule"].isin([
+                            "debiased_chi_detected",
+                            "debiased_fdr_detected",
+                            "debiased_bic_detected",
+                            "debiased_D_gt_10p0_detected",
+                            "debiased_D_gt_15p0_detected",
+                            "debiased_D_gt_20p0_detected",
+                            "debiased_D_gt_25p0_detected"
+                        ])
                     ]
-                ].to_string(
-                    index=False
-                )
-            )
 
-        completed_units.add(
-            unit_key
-        )
-        save_checkpoint(
-            all_link_rows=all_link_rows,
-            all_true_link_tables=all_true_link_tables,
-            completed_units=completed_units,
-            true_link_outer_runs=true_link_outer_runs
-        )
+                    print(
+                        temp_display[
+                            [
+                                "signal_type",
+                                "lambda_A",
+                                "decision_rule",
+                                "fpr",
+                                "tpr",
+                                "precision",
+                                "f1",
+                                "tp",
+                                "fp",
+                                "tn",
+                                "fn"
+                            ]
+                        ].to_string(index=False)
+                    )
+
+                completed_units.add(
+                    (
+                        outer_run,
+                        "l1_mstep",
+                        float(lambda_A)
+                    )
+                )
+
+                # Only this parent thread mutates restart state or files.
+                save_checkpoint(
+                    all_link_rows=all_link_rows,
+                    all_true_link_tables=all_true_link_tables,
+                    completed_units=completed_units,
+                    true_link_outer_runs=true_link_outer_runs
+                )
 
     # --------------------------------------------------
     # Save partial progress after each outer run
     # --------------------------------------------------
 
     os.makedirs(
-        "results",
+        "data",
         exist_ok=True
     )
 
@@ -1778,7 +1875,7 @@ for outer_run in range(N_OUTER_RUNS):
     )
 
     partial_df.to_csv(
-        "results/experiment_32f_l1_mstep_sparse_a_em_results_partial.csv",
+        "data/experiment_32g_l1_mstep_fixed_covariance_results_partial.csv",
         index=False
     )
 
@@ -1786,7 +1883,7 @@ for outer_run in range(N_OUTER_RUNS):
         all_true_link_tables,
         ignore_index=True
     ).to_csv(
-        "results/experiment_32f_l1_mstep_sparse_a_em_true_links_partial.csv",
+        "data/experiment_32g_l1_mstep_fixed_covariance_true_links_partial.csv",
         index=False
     )
 
@@ -1817,7 +1914,7 @@ decision_summary_df = summarize_decision_rules(
 
 
 print("\n" + "=" * 160)
-print("Experiment 32F link-strength summary")
+print("Experiment 32G link-strength summary")
 print("=" * 160)
 
 link_strength_display_columns = [
@@ -1852,6 +1949,10 @@ link_strength_display_columns = [
 
     "mean_full_Q_trace",
     "mean_full_R_trace",
+    "mean_fixed_Q_trace",
+    "mean_fixed_R_trace",
+    "mean_estimate_Q",
+    "mean_estimate_R",
     "mean_full_Q_offdiag_abs",
     "mean_full_R_offdiag_abs",
 
@@ -1873,7 +1974,7 @@ print(
 
 
 print("\n" + "=" * 160)
-print("Experiment 32F decision-rule summary")
+print("Experiment 32G decision-rule summary")
 print("=" * 160)
 
 decision_display_columns = [
@@ -1908,14 +2009,14 @@ print(
 # ------------------------------------------------------
 
 os.makedirs(
-    "results",
+    "data",
     exist_ok=True
 )
 
-results_path = "results/experiment_32f_l1_mstep_sparse_a_em_results.csv"
-true_links_path = "results/experiment_32f_l1_mstep_sparse_a_em_true_links.csv"
-link_strength_summary_path = "results/experiment_32f_l1_mstep_sparse_a_em_link_strength_summary.csv"
-decision_summary_path = "results/experiment_32f_l1_mstep_sparse_a_em_decision_summary.csv"
+results_path = "data/experiment_32g_l1_mstep_fixed_covariance_results.csv"
+true_links_path = "data/experiment_32g_l1_mstep_fixed_covariance_true_links.csv"
+link_strength_summary_path = "data/experiment_32g_l1_mstep_fixed_covariance_link_strength_summary.csv"
+decision_summary_path = "data/experiment_32g_l1_mstep_fixed_covariance_decision_summary.csv"
 
 results_df.to_csv(
     results_path,

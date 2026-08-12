@@ -83,6 +83,13 @@ Do not silently change simulation parameters.
 
 Do not silently change Monte Carlo settings.
 
+Long-running experiments should save atomic, resumable checkpoints at
+scientifically safe work-unit boundaries. A resumed run must validate that
+its numerical configuration matches the checkpoint, must not duplicate
+completed work, and must preserve random seeds and output schemas. Delete
+restart checkpoints only after all final outputs have been written
+successfully.
+
 --------------------------------------------------
 
 IMPLEMENTATION STYLE

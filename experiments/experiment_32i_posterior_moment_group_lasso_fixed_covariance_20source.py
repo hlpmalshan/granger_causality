@@ -1,9 +1,23 @@
 import os
+
+# Each thread handles a complete EM fit. Limiting BLAS threads prevents
+# nested parallelism from multiplying OpenBLAS/MKL worker threads.
+BLAS_THREADS_PER_WORKER = int(
+    os.environ.get("EXPERIMENT_32I_BLAS_THREADS", "1")
+)
+os.environ["OPENBLAS_NUM_THREADS"] = str(BLAS_THREADS_PER_WORKER)
+os.environ["OMP_NUM_THREADS"] = str(BLAS_THREADS_PER_WORKER)
+os.environ["MKL_NUM_THREADS"] = str(BLAS_THREADS_PER_WORKER)
+
 import pickle
 import glob
 import time
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pandas as pd
+
+RESULTS_DIR = os.environ.get("EXPERIMENT_32I_RESULTS_DIR", "results")
+DATA_DIR = os.environ.get("EXPERIMENT_32I_DATA_DIR", "data")
 
 from src.varx.varx_generator import (
     generate_colored_input
@@ -13,9 +27,10 @@ from src.ssm.ssm_varx_p_simulator import (
     generate_ssm_varx_p_data
 )
 
-from src.ssm.em_varx_p_known_c_l1_mstep import (
-    EMVARXPSSMKnownCConstrainedWarmStartL1Mstep
+from src.ssm.em_varx_p_known_c_group_lasso_posterior_moments import (
+    EMVARXPSSMKnownCConstrainedWarmStartGroupLassoPosteriorMomentMstepFixedCov
 )
+from src.ssm.em_varx_p_known_c_l1_mstep import NUMBA_AVAILABLE
 
 from src.stats.observed_likelihood_deviance import (
     final_observed_log_likelihood
@@ -29,8 +44,8 @@ from src.stats.scalable_debiased_varx_network import (
 
 
 # ------------------------------------------------------
-# Experiment 32F
-# Row-wise L1 M-step Sparse-A VARX EM
+# Experiment 32I
+# Posterior-moment group-lasso M-step with fixed covariance
 # ------------------------------------------------------
 
 N_SOURCES = 20
@@ -74,29 +89,41 @@ CUSTOM_THRESHOLDS = (
     25.0
 )
 
-# Finer grid around the useful region from 32E.
-# lambda_A = 0.00 is the no-L1 baseline under the same L1-M-step framework.
-LAMBDA_A_GRID = [
-    0.00,
+LAMBDA_A_GROUP_FRACTION_GRID = [
+    0.0,
     0.001,
     0.003,
-    0.006,
-    0.010,
-    0.020,
-    0.030
+    0.01,
+    0.03,
+    0.10,
+    0.30,
+    0.60
 ]
 
+# Four workers is a conservative default for the memory-heavy EM fits.
+# Override explicitly for a particular machine, for example:
+#   $env:EXPERIMENT_32I_WORKERS = "8"
+N_WORKERS = int(
+    os.environ.get(
+        "EXPERIMENT_32I_WORKERS",
+        str(min(4, os.cpu_count() or 1, len(LAMBDA_A_GROUP_FRACTION_GRID)))
+    )
+)
+
+if N_WORKERS < 1:
+    raise ValueError("EXPERIMENT_32I_WORKERS must be at least 1.")
+
 SHRINKAGE_SPEC = {
-    "name": "QR_0p20",
-    "alpha_Q": 0.20,
-    "alpha_R": 0.20,
+    "name": "fixed_Q0p50_R0p60",
+    "alpha_Q": 0.0,
+    "alpha_R": 0.0,
     "target_Q": "spherical",
     "target_R": "spherical"
 }
 
 
-print("\nExperiment 32F: row-wise L1 M-step sparse-A VARX EM")
-print("----------------------------------------------------")
+print("\nExperiment 32I: posterior-moment group-lasso with fixed covariance")
+print("----------------------------------------------------------")
 print("N sources:", N_SOURCES)
 print("Link density:", LINK_DENSITY)
 print("N true links:", N_TRUE_LINKS)
@@ -110,8 +137,11 @@ print("R floor:", R_FLOOR)
 print("max EM iterations:", MAX_ITER)
 print("tol:", TOL)
 print("debiased ridge lambda:", RIDGE_LAMBDA_DEBIAS)
-print("lambda_A grid:", LAMBDA_A_GRID)
-print("covariance shrinkage:", SHRINKAGE_SPEC["name"])
+print("lambda_A_group_fraction grid:", LAMBDA_A_GROUP_FRACTION_GRID)
+print("covariance control:", SHRINKAGE_SPEC["name"])
+print("parallel worker threads:", N_WORKERS)
+print("BLAS threads per worker:", BLAS_THREADS_PER_WORKER)
+print("Numba group solver:", "enabled" if NUMBA_AVAILABLE else "fallback")
 
 
 # ------------------------------------------------------
@@ -742,14 +772,14 @@ def kalman_filter_and_rts_smoother(
 # Model fitting and signal helpers
 # ------------------------------------------------------
 
-def fit_l1_mstep_em_model(
+def fit_posterior_moment_group_lasso_fixed_cov_em_model(
         y_obs,
         u,
         C,
-        lambda_A,
+        lambda_A_group_fraction,
         random_seed
 ):
-    model = EMVARXPSSMKnownCConstrainedWarmStartL1Mstep(
+    model = EMVARXPSSMKnownCConstrainedWarmStartGroupLassoPosteriorMomentMstepFixedCov(
         na=na,
         nb=nb,
         C=C,
@@ -758,13 +788,14 @@ def fit_l1_mstep_em_model(
         tol=TOL,
 
         # Kept for compatibility with inherited class.
-        # The main A/B update is now done inside the row-wise L1 M-step.
+        # The main A/B update is done by the posterior-moment group solver.
         ridge_m_step=1e-4,
 
         covariance_floor=1e-6,
         R_init=0.60 * np.eye(N_SOURCES),
         Q_init=0.50 * np.eye(N_SOURCES),
-        estimate_R=True,
+        estimate_Q=False,
+        estimate_R=False,
         R_floor=R_FLOOR,
         zero_constraints=[],
         initial_parameters=None,
@@ -772,25 +803,22 @@ def fit_l1_mstep_em_model(
         random_seed=random_seed,
         verbose=False,
 
-        # Covariance shrinkage from 31G/32A.
+        # Inert while Q/R are fixed; retained for constructor compatibility.
         alpha_Q=SHRINKAGE_SPEC["alpha_Q"],
         alpha_R=SHRINKAGE_SPEC["alpha_R"],
         shrinkage_target_Q=SHRINKAGE_SPEC["target_Q"],
         shrinkage_target_R=SHRINKAGE_SPEC["target_R"],
 
-        # Row-wise L1 M-step.
-        lambda_A_offdiag=lambda_A,
-        lambda_A_diag=0.0,
-        lambda_B=0.0,
+        # Target-relative posterior-moment group-lasso M-step.
+        lambda_A_group_fraction=lambda_A_group_fraction,
 
         # Weak ridge for numerical stability.
         ridge_A_offdiag=1e-4,
         ridge_A_diag=1e-4,
         ridge_B=1e-4,
 
-        lambda_A_lag_decay=1.0,
-        lasso_max_iter=1000,
-        lasso_tol=1e-6,
+        group_solver_max_iter=5000,
+        group_solver_tol=1e-7,
 
         stabilize_A=True,
         target_radius=0.98
@@ -801,7 +829,10 @@ def fit_l1_mstep_em_model(
         u=u
     )
 
-    model.fit_label = f"l1_mstep_lambda_{lambda_A}"
+    model.fit_label = (
+        "posterior_moment_group_lasso_fixed_cov_fraction_"
+        f"{lambda_A_group_fraction}"
+    )
 
     return model
 
@@ -940,7 +971,7 @@ def add_metadata(
         outer_run,
         random_seed,
         signal_type,
-        lambda_A,
+        lambda_A_group_fraction,
         signal_mse,
         signal_corr_mean,
         signal_corr_median,
@@ -959,7 +990,7 @@ def add_metadata(
     df["link_density"] = LINK_DENSITY
 
     df["signal_type"] = signal_type
-    df["lambda_A"] = lambda_A
+    df["lambda_A_group_fraction"] = lambda_A_group_fraction
 
     df["signal_mse_to_true_x"] = signal_mse
     df["signal_correlation_mean_to_true_x"] = signal_corr_mean
@@ -989,10 +1020,48 @@ def add_metadata(
             full_model.log_likelihoods
         )
 
-        df["em_A_nonzero_offdiag"] = full_model.count_nonzero_offdiag_A()
-        df["em_A_nonzero_total"] = full_model.count_nonzero_total_A()
+        df["em_A_nonzero_offdiag_coefficients"] = (
+            full_model.count_nonzero_offdiag_A_coefficients()
+        )
+        df["em_A_nonzero_total_coefficients"] = (
+            full_model.count_nonzero_total_A_coefficients()
+        )
+        df["em_A_nonzero_offdiag_groups"] = (
+            full_model.count_nonzero_offdiag_A_groups()
+        )
+        df["em_A_nonzero_total_groups"] = (
+            full_model.count_nonzero_total_A_groups()
+        )
+        df["em_A_mean_offdiag_group_norm"] = (
+            full_model.mean_offdiag_A_group_norm()
+        )
+        df["em_A_median_offdiag_group_norm"] = (
+            full_model.median_offdiag_A_group_norm()
+        )
+        df["em_A_max_offdiag_group_norm"] = (
+            full_model.max_offdiag_A_group_norm()
+        )
         df["em_A_mean_abs_offdiag"] = full_model.mean_abs_offdiag_A()
         df["em_A_max_abs_offdiag"] = full_model.max_abs_offdiag_A()
+
+        df["mean_lambda_A_group_effective"] = (
+            full_model.mean_lambda_A_group_effective
+        )
+        df["median_lambda_A_group_effective"] = (
+            full_model.median_lambda_A_group_effective
+        )
+        df["min_lambda_A_group_effective"] = (
+            full_model.min_lambda_A_group_effective
+        )
+        df["max_lambda_A_group_effective"] = (
+            full_model.max_lambda_A_group_effective
+        )
+        df["moment_solver_condition_number_mean"] = (
+            full_model.moment_solver_condition_number_mean
+        )
+        df["moment_solver_condition_number_max"] = (
+            full_model.moment_solver_condition_number_max
+        )
 
         df["full_Q_trace"] = float(
             np.trace(
@@ -1005,6 +1074,11 @@ def add_metadata(
                 full_model.R
             )
         )
+
+        df["fixed_Q_trace"] = full_model.fixed_Q_trace
+        df["fixed_R_trace"] = full_model.fixed_R_trace
+        df["estimate_Q"] = full_model.estimate_Q
+        df["estimate_R"] = full_model.estimate_R
 
         df["full_Q_offdiag_mean_abs"] = float(
             np.mean(
@@ -1032,25 +1106,25 @@ def add_metadata(
             )
         )
 
-        if hasattr(full_model, "lasso_converged_history"):
+        if len(full_model.group_solver_converged_history) > 0:
 
-            df["lasso_converged_last"] = bool(
-                full_model.lasso_converged_history[-1]
-            ) if len(full_model.lasso_converged_history) > 0 else np.nan
+            df["group_solver_converged_last"] = bool(
+                full_model.group_solver_converged_history[-1]
+            )
 
-            df["lasso_mean_iterations_last"] = float(
-                full_model.lasso_iterations_history[-1]
-            ) if len(full_model.lasso_iterations_history) > 0 else np.nan
+            df["group_solver_mean_iterations_last"] = float(
+                full_model.group_solver_iterations_history[-1]
+            )
 
-            df["lasso_objective_last"] = float(
-                full_model.lasso_objective_history[-1]
-            ) if len(full_model.lasso_objective_history) > 0 else np.nan
+            df["group_solver_objective_last"] = float(
+                full_model.group_solver_objective_history[-1]
+            )
 
         else:
 
-            df["lasso_converged_last"] = np.nan
-            df["lasso_mean_iterations_last"] = np.nan
-            df["lasso_objective_last"] = np.nan
+            df["group_solver_converged_last"] = np.nan
+            df["group_solver_mean_iterations_last"] = np.nan
+            df["group_solver_objective_last"] = np.nan
 
     else:
 
@@ -1058,19 +1132,34 @@ def add_metadata(
         df["full_spectral_radius"] = np.nan
         df["full_em_iterations"] = np.nan
 
-        df["em_A_nonzero_offdiag"] = np.nan
-        df["em_A_nonzero_total"] = np.nan
+        df["em_A_nonzero_offdiag_coefficients"] = np.nan
+        df["em_A_nonzero_total_coefficients"] = np.nan
+        df["em_A_nonzero_offdiag_groups"] = np.nan
+        df["em_A_nonzero_total_groups"] = np.nan
+        df["em_A_mean_offdiag_group_norm"] = np.nan
+        df["em_A_median_offdiag_group_norm"] = np.nan
+        df["em_A_max_offdiag_group_norm"] = np.nan
         df["em_A_mean_abs_offdiag"] = np.nan
         df["em_A_max_abs_offdiag"] = np.nan
+        df["mean_lambda_A_group_effective"] = np.nan
+        df["median_lambda_A_group_effective"] = np.nan
+        df["min_lambda_A_group_effective"] = np.nan
+        df["max_lambda_A_group_effective"] = np.nan
+        df["moment_solver_condition_number_mean"] = np.nan
+        df["moment_solver_condition_number_max"] = np.nan
 
         df["full_Q_trace"] = np.nan
         df["full_R_trace"] = np.nan
+        df["fixed_Q_trace"] = np.nan
+        df["fixed_R_trace"] = np.nan
+        df["estimate_Q"] = np.nan
+        df["estimate_R"] = np.nan
         df["full_Q_offdiag_mean_abs"] = np.nan
         df["full_R_offdiag_mean_abs"] = np.nan
 
-        df["lasso_converged_last"] = np.nan
-        df["lasso_mean_iterations_last"] = np.nan
-        df["lasso_objective_last"] = np.nan
+        df["group_solver_converged_last"] = np.nan
+        df["group_solver_mean_iterations_last"] = np.nan
+        df["group_solver_objective_last"] = np.nan
 
     return df
 
@@ -1080,7 +1169,7 @@ def compute_network_for_signal(
         u,
         true_link_mask,
         signal_type,
-        lambda_A,
+        lambda_A_group_fraction,
         outer_run,
         random_seed,
         x_true,
@@ -1110,7 +1199,7 @@ def compute_network_for_signal(
         outer_run=outer_run,
         random_seed=random_seed,
         signal_type=signal_type,
-        lambda_A=lambda_A,
+        lambda_A_group_fraction=lambda_A_group_fraction,
         signal_mse=recovery["mse"],
         signal_corr_mean=recovery["corr_mean"],
         signal_corr_median=recovery["corr_median"],
@@ -1123,6 +1212,109 @@ def compute_network_for_signal(
     return network_df
 
 
+def build_A_support_table(
+        model,
+        true_link_mask,
+        outer_run,
+        random_seed,
+        lambda_A_group_fraction
+):
+    """Build post-hoc directed-link diagnostics from fitted A group norms."""
+
+    if len(model.A_matrices) < 2:
+        raise ValueError("Experiment 32I requires at least two A lags.")
+
+    rows = []
+
+    for target in range(N_SOURCES):
+        for source in range(N_SOURCES):
+            if source == target:
+                continue
+
+            lag_values = np.asarray(
+                [A[target, source] for A in model.A_matrices],
+                dtype=float
+            )
+            group_norm = float(np.linalg.norm(lag_values))
+            rows.append({
+                "outer_run": outer_run,
+                "random_seed": random_seed,
+                "lambda_A_group_fraction": lambda_A_group_fraction,
+                "source": source,
+                "target": target,
+                "true_link": bool(true_link_mask[target, source]),
+                "estimated_A_group_norm": group_norm,
+                "estimated_A_lag1": float(lag_values[0]),
+                "estimated_A_lag2": float(lag_values[1]),
+                "selected_nonzero_group_threshold_1e_minus_8": (
+                    group_norm > 1e-8
+                ),
+                "selected_group_norm_gt_0p001": group_norm > 0.001,
+                "selected_group_norm_gt_0p003": group_norm > 0.003,
+                "selected_group_norm_gt_0p01": group_norm > 0.01,
+                "selected_group_norm_gt_0p03": group_norm > 0.03
+            })
+
+    support_df = pd.DataFrame(rows)
+    norms = support_df["estimated_A_group_norm"].to_numpy()
+    descending_order = np.argsort(-norms, kind="mergesort")
+    n_pairs = len(support_df)
+    top_counts = {
+        "selected_top_19_group_norm": min(N_TRUE_LINKS, n_pairs),
+        "selected_top_5_percent_group_norm": max(
+            1,
+            int(round(0.05 * n_pairs))
+        ),
+        "selected_top_10_percent_group_norm": max(
+            1,
+            int(round(0.10 * n_pairs))
+        )
+    }
+
+    for column, count in top_counts.items():
+        selected = np.zeros(n_pairs, dtype=bool)
+        selected[descending_order[:count]] = True
+        support_df[column] = selected
+
+    return support_df
+
+
+A_SUPPORT_SELECTION_RULES = [
+    "selected_nonzero_group_threshold_1e_minus_8",
+    "selected_group_norm_gt_0p001",
+    "selected_group_norm_gt_0p003",
+    "selected_group_norm_gt_0p01",
+    "selected_group_norm_gt_0p03",
+    "selected_top_19_group_norm",
+    "selected_top_5_percent_group_norm",
+    "selected_top_10_percent_group_norm"
+]
+
+
+def summarize_A_support(A_support_df):
+    rows = []
+    grouped = A_support_df.groupby(
+        "lambda_A_group_fraction",
+        dropna=False
+    )
+
+    for lambda_fraction, group in grouped:
+        for selection_rule in A_SUPPORT_SELECTION_RULES:
+            metrics = compute_confusion_metrics(
+                y_true=group["true_link"].values,
+                y_pred=group[selection_rule].values
+            )
+            row = {
+                "lambda_A_group_fraction": lambda_fraction,
+                "selection_rule": selection_rule,
+                "n_tests": len(group)
+            }
+            row.update(metrics)
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
 # ------------------------------------------------------
 # Summary helpers
 # ------------------------------------------------------
@@ -1133,7 +1325,7 @@ def summarize_link_strengths(
     grouped = results_df.groupby(
         [
             "signal_type",
-            "lambda_A",
+            "lambda_A_group_fraction",
             "true_link"
         ],
         dropna=False
@@ -1143,11 +1335,11 @@ def summarize_link_strengths(
 
     for keys, group in grouped:
 
-        signal_type, lambda_A, true_link = keys
+        signal_type, lambda_A_group_fraction, true_link = keys
 
         rows.append({
             "signal_type": signal_type,
-            "lambda_A": lambda_A,
+            "lambda_A_group_fraction": lambda_A_group_fraction,
             "true_link": true_link,
             "n_links": len(group),
 
@@ -1188,19 +1380,35 @@ def summarize_link_strengths(
             "mean_full_spectral_radius": group["full_spectral_radius"].mean(),
             "mean_full_em_iterations": group["full_em_iterations"].mean(),
 
-            "mean_em_A_nonzero_offdiag": group["em_A_nonzero_offdiag"].mean(),
-            "mean_em_A_nonzero_total": group["em_A_nonzero_total"].mean(),
+            "mean_em_A_nonzero_offdiag_coefficients": group["em_A_nonzero_offdiag_coefficients"].mean(),
+            "mean_em_A_nonzero_total_coefficients": group["em_A_nonzero_total_coefficients"].mean(),
+            "mean_em_A_nonzero_offdiag_groups": group["em_A_nonzero_offdiag_groups"].mean(),
+            "mean_em_A_nonzero_total_groups": group["em_A_nonzero_total_groups"].mean(),
+            "mean_em_A_mean_offdiag_group_norm": group["em_A_mean_offdiag_group_norm"].mean(),
+            "mean_em_A_median_offdiag_group_norm": group["em_A_median_offdiag_group_norm"].mean(),
+            "mean_em_A_max_offdiag_group_norm": group["em_A_max_offdiag_group_norm"].mean(),
             "mean_em_A_mean_abs_offdiag": group["em_A_mean_abs_offdiag"].mean(),
             "mean_em_A_max_abs_offdiag": group["em_A_max_abs_offdiag"].mean(),
 
+            "mean_lambda_A_group_effective": group["mean_lambda_A_group_effective"].mean(),
+            "median_lambda_A_group_effective": group["median_lambda_A_group_effective"].median(),
+            "min_lambda_A_group_effective": group["min_lambda_A_group_effective"].min(),
+            "max_lambda_A_group_effective": group["max_lambda_A_group_effective"].max(),
+            "mean_moment_solver_condition_number": group["moment_solver_condition_number_mean"].mean(),
+            "max_moment_solver_condition_number": group["moment_solver_condition_number_max"].max(),
+
             "mean_full_Q_trace": group["full_Q_trace"].mean(),
             "mean_full_R_trace": group["full_R_trace"].mean(),
+            "mean_fixed_Q_trace": group["fixed_Q_trace"].mean(),
+            "mean_fixed_R_trace": group["fixed_R_trace"].mean(),
+            "mean_estimate_Q": group["estimate_Q"].mean(),
+            "mean_estimate_R": group["estimate_R"].mean(),
             "mean_full_Q_offdiag_abs": group["full_Q_offdiag_mean_abs"].mean(),
             "mean_full_R_offdiag_abs": group["full_R_offdiag_mean_abs"].mean(),
 
-            "mean_lasso_converged_last": group["lasso_converged_last"].mean(),
-            "mean_lasso_iterations_last": group["lasso_mean_iterations_last"].mean(),
-            "mean_lasso_objective_last": group["lasso_objective_last"].mean(),
+            "mean_group_solver_converged_last": group["group_solver_converged_last"].mean(),
+            "mean_group_solver_iterations_last": group["group_solver_mean_iterations_last"].mean(),
+            "mean_group_solver_objective_last": group["group_solver_objective_last"].mean(),
 
             # Mixing matrix
             "mean_C_condition_number": group["C_condition_number"].mean(),
@@ -1239,7 +1447,7 @@ def summarize_decision_rules(
     grouped = results_df.groupby(
         [
             "signal_type",
-            "lambda_A"
+            "lambda_A_group_fraction"
         ],
         dropna=False
     )
@@ -1248,7 +1456,7 @@ def summarize_decision_rules(
 
     for keys, group in grouped:
 
-        signal_type, lambda_A = keys
+        signal_type, lambda_A_group_fraction = keys
 
         for decision_column in decision_columns:
 
@@ -1259,7 +1467,7 @@ def summarize_decision_rules(
 
             row = {
                 "signal_type": signal_type,
-                "lambda_A": lambda_A,
+                "lambda_A_group_fraction": lambda_A_group_fraction,
                 "decision_rule": decision_column,
                 "n_tests": len(group)
             }
@@ -1282,8 +1490,10 @@ def summarize_decision_rules(
 # ------------------------------------------------------
 
 CHECKPOINT_PATH = (
-    "results/"
-    "experiment_32f_l1_mstep_sparse_a_em_checkpoint.pkl"
+    os.path.join(
+        RESULTS_DIR,
+        "experiment_32i_posterior_moment_group_lasso_fixed_covariance_checkpoint.pkl"
+    )
 )
 
 CHECKPOINT_REPLACE_ATTEMPTS = 8
@@ -1315,14 +1525,26 @@ def checkpoint_configuration():
         "ridge_lambda_debias": RIDGE_LAMBDA_DEBIAS,
         "base_seed": BASE_SEED,
         "custom_thresholds": CUSTOM_THRESHOLDS,
-        "lambda_A_grid": LAMBDA_A_GRID,
-        "shrinkage_spec": SHRINKAGE_SPEC
+        "lambda_A_group_fraction_grid": LAMBDA_A_GROUP_FRACTION_GRID,
+        "penalty": "offdiag_source_target_group_lasso_across_A_lags",
+        "group_solver": "standardized_full_covariance_proximal_gradient",
+        "group_solver_max_iter": 5000,
+        "group_solver_tol": 1e-7,
+        "ridge_A_offdiag": 1e-4,
+        "ridge_A_diag": 1e-4,
+        "ridge_B": 1e-4,
+        "shrinkage_spec": SHRINKAGE_SPEC,
+        "estimate_Q": False,
+        "estimate_R": False,
+        "Q_init_scale": 0.50,
+        "R_init_scale": 0.60
     }
 
 
 def save_checkpoint(
         all_link_rows,
         all_true_link_tables,
+        all_A_support_rows,
         completed_units,
         true_link_outer_runs
 ):
@@ -1342,6 +1564,7 @@ def save_checkpoint(
         "configuration": checkpoint_configuration(),
         "all_link_rows": all_link_rows,
         "all_true_link_tables": all_true_link_tables,
+        "all_A_support_rows": all_A_support_rows,
         "completed_units": completed_units,
         "true_link_outer_runs": true_link_outer_runs
     }
@@ -1418,6 +1641,7 @@ def load_checkpoint():
         return {
             "all_link_rows": [],
             "all_true_link_tables": [],
+            "all_A_support_rows": [],
             "completed_units": set(),
             "true_link_outer_runs": set()
         }
@@ -1443,14 +1667,14 @@ def load_checkpoint():
 
     if checkpoint is None:
         raise RuntimeError(
-            "Experiment 32F found checkpoint files, but none could be "
+            "Experiment 32I found checkpoint files, but none could be "
             "read. Preserve them for diagnosis and inspect: "
             f"{CHECKPOINT_PATH}*.tmp"
         )
 
     if checkpoint.get("configuration") != checkpoint_configuration():
         raise ValueError(
-            "Experiment 32F checkpoint settings do not match the current "
+            "Experiment 32I checkpoint settings do not match the current "
             "experiment settings. Move or delete the checkpoint before "
             "starting a different configuration: "
             f"{CHECKPOINT_PATH}"
@@ -1463,7 +1687,7 @@ def load_checkpoint():
         checkpoint["true_link_outer_runs"]
     )
 
-    print("\nResuming Experiment 32F from checkpoint:")
+    print("\nResuming Experiment 32I from checkpoint:")
     print(loaded_path)
     print(
         "Completed work units:",
@@ -1489,6 +1713,163 @@ def remove_checkpoint_files():
             print(checkpoint_path)
 
 
+def run_group_lasso_work_unit(task):
+    """Fit and evaluate one lambda value without writing shared outputs."""
+
+    lambda_A_group_fraction = task["lambda_A_group_fraction"]
+    y_obs = task["y_obs"]
+    u = task["u"]
+    C = task["C"]
+    seed = task["seed"]
+
+    print("\n" + "-" * 100)
+    print(
+        "Fitting posterior-moment fixed-covariance group-lasso M-step EM with "
+        f"lambda_A_group_fraction={lambda_A_group_fraction}"
+    )
+    print("-" * 100)
+
+    full_model = fit_posterior_moment_group_lasso_fixed_cov_em_model(
+        y_obs=y_obs,
+        u=u,
+        C=C,
+        lambda_A_group_fraction=lambda_A_group_fraction,
+        random_seed=seed + 500
+    )
+
+    print("Full LL:", final_observed_log_likelihood(full_model))
+    print("EM iterations:", len(full_model.log_likelihoods))
+    print("Spectral radius:", full_model.spectral_radius())
+    print("Q trace:", float(np.trace(full_model.Q)))
+    print("R trace:", float(np.trace(full_model.R)))
+    print(
+        "Nonzero offdiag A coefficients:",
+        full_model.count_nonzero_offdiag_A_coefficients()
+    )
+    print(
+        "Nonzero total A coefficients:",
+        full_model.count_nonzero_total_A_coefficients()
+    )
+    print(
+        "Nonzero offdiag A groups:",
+        full_model.count_nonzero_offdiag_A_groups()
+    )
+    print("Nonzero total A groups:", full_model.count_nonzero_total_A_groups())
+    print("Mean offdiag group norm:", full_model.mean_offdiag_A_group_norm())
+    print("Median offdiag group norm:", full_model.median_offdiag_A_group_norm())
+    print("Max offdiag group norm:", full_model.max_offdiag_A_group_norm())
+    print("Mean abs offdiag A:", full_model.mean_abs_offdiag_A())
+    print("Max abs offdiag A:", full_model.max_abs_offdiag_A())
+    print("Mean effective group lambda:", full_model.mean_lambda_A_group_effective)
+    print("Median effective group lambda:", full_model.median_lambda_A_group_effective)
+    print("Min effective group lambda:", full_model.min_lambda_A_group_effective)
+    print("Max effective group lambda:", full_model.max_lambda_A_group_effective)
+    print(
+        "Mean moment condition number:",
+        full_model.moment_solver_condition_number_mean
+    )
+    print(
+        "Max moment condition number:",
+        full_model.moment_solver_condition_number_max
+    )
+
+    if len(full_model.group_solver_converged_history) > 0:
+        print(
+            "Group solver converged last:",
+            full_model.group_solver_converged_history[-1]
+        )
+        print(
+            "Group solver mean iterations last:",
+            full_model.group_solver_iterations_history[-1]
+        )
+        print(
+            "Group solver objective last:",
+            full_model.group_solver_objective_history[-1]
+        )
+
+    A_support_df = build_A_support_table(
+        model=full_model,
+        true_link_mask=task["true_link_mask"],
+        outer_run=task["outer_run"],
+        random_seed=seed,
+        lambda_A_group_fraction=lambda_A_group_fraction
+    )
+    A_support_display = summarize_A_support(A_support_df)
+    A_support_display = A_support_display[
+        A_support_display["selection_rule"].isin([
+            "selected_top_19_group_norm",
+            "selected_group_norm_gt_0p01",
+            "selected_group_norm_gt_0p03"
+        ])
+    ]
+    print("\nSelected A-support diagnostics:")
+    print(
+        A_support_display[
+            [
+                "lambda_A_group_fraction",
+                "selection_rule",
+                "fpr",
+                "tpr",
+                "precision",
+                "f1",
+                "tp",
+                "fp",
+                "tn",
+                "fn"
+            ]
+        ].to_string(index=False)
+    )
+
+    posterior = kalman_filter_and_rts_smoother(
+        y=y_obs,
+        u=u,
+        A_matrices=full_model.A_matrices,
+        B_matrices=full_model.B_matrices,
+        Q=full_model.Q,
+        C=C,
+        R=full_model.R
+    )
+
+    signal_specs = [
+        {
+            "signal_type": "em_filtered",
+            "signal": posterior["filtered_x"]
+        },
+        {
+            "signal_type": "em_smoothed",
+            "signal": posterior["smoothed_x"]
+        }
+    ]
+
+    network_dfs = []
+
+    for spec in signal_specs:
+        print(
+            "\nComputing network for:",
+            spec["signal_type"],
+            "lambda_A_group_fraction:",
+            lambda_A_group_fraction
+        )
+
+        network_df = compute_network_for_signal(
+            signal=spec["signal"],
+            u=u,
+            true_link_mask=task["true_link_mask"],
+            signal_type=spec["signal_type"],
+            lambda_A_group_fraction=lambda_A_group_fraction,
+            outer_run=task["outer_run"],
+            random_seed=seed,
+            x_true=task["x_true"],
+            C_diagnostics=task["C_diagnostics"],
+            full_model=full_model,
+            radius_true=task["radius_true"],
+            scale_factor=task["scale_factor"]
+        )
+        network_dfs.append(network_df)
+
+    return float(lambda_A_group_fraction), network_dfs, A_support_df
+
+
 # ------------------------------------------------------
 # Main experiment
 # ------------------------------------------------------
@@ -1497,13 +1878,14 @@ checkpoint = load_checkpoint()
 
 all_link_rows = checkpoint["all_link_rows"]
 all_true_link_tables = checkpoint["all_true_link_tables"]
+all_A_support_rows = checkpoint["all_A_support_rows"]
 completed_units = checkpoint["completed_units"]
 true_link_outer_runs = checkpoint["true_link_outer_runs"]
 
 for outer_run in range(N_OUTER_RUNS):
 
     print("\n" + "=" * 120)
-    print(f"Experiment 32F | outer run {outer_run + 1}/{N_OUTER_RUNS}")
+    print(f"Experiment 32I | outer run {outer_run + 1}/{N_OUTER_RUNS}")
     print("=" * 120)
 
     seed = BASE_SEED + outer_run
@@ -1545,6 +1927,7 @@ for outer_run in range(N_OUTER_RUNS):
         save_checkpoint(
             all_link_rows=all_link_rows,
             all_true_link_tables=all_true_link_tables,
+            all_A_support_rows=all_A_support_rows,
             completed_units=completed_units,
             true_link_outer_runs=true_link_outer_runs
         )
@@ -1562,19 +1945,19 @@ for outer_run in range(N_OUTER_RUNS):
         {
             "signal_type": "oracle_latent",
             "signal": x_true,
-            "lambda_A": np.nan,
+            "lambda_A_group_fraction": np.nan,
             "full_model": None
         },
         {
             "signal_type": "observed_y",
             "signal": y_obs,
-            "lambda_A": np.nan,
+            "lambda_A_group_fraction": np.nan,
             "full_model": None
         },
         {
             "signal_type": "pinv_proxy",
             "signal": x_pinv_proxy,
-            "lambda_A": np.nan,
+            "lambda_A_group_fraction": np.nan,
             "full_model": None
         }
     ]
@@ -1601,7 +1984,7 @@ for outer_run in range(N_OUTER_RUNS):
             u=u,
             true_link_mask=true_link_mask,
             signal_type=spec["signal_type"],
-            lambda_A=spec["lambda_A"],
+            lambda_A_group_fraction=spec["lambda_A_group_fraction"],
             outer_run=outer_run,
             random_seed=seed,
             x_true=x_true,
@@ -1620,155 +2003,126 @@ for outer_run in range(N_OUTER_RUNS):
         save_checkpoint(
             all_link_rows=all_link_rows,
             all_true_link_tables=all_true_link_tables,
+            all_A_support_rows=all_A_support_rows,
             completed_units=completed_units,
             true_link_outer_runs=true_link_outer_runs
         )
 
     # --------------------------------------------------
-    # L1-M-step EM comparisons
+    # group-lasso M-step EM comparisons
     # --------------------------------------------------
 
-    for lambda_A in LAMBDA_A_GRID:
-
-        unit_key = (
+    pending_group_tasks = [
+        {
+            "lambda_A_group_fraction": float(lambda_A_group_fraction),
+            "y_obs": y_obs,
+            "u": u,
+            "C": C,
+            "seed": seed,
+            "true_link_mask": true_link_mask,
+            "outer_run": outer_run,
+            "x_true": x_true,
+            "C_diagnostics": C_diagnostics,
+            "radius_true": data["radius_after"],
+            "scale_factor": data["scale_factor"]
+        }
+        for lambda_A_group_fraction in LAMBDA_A_GROUP_FRACTION_GRID
+        if (
             outer_run,
-            "l1_mstep",
-            float(lambda_A)
+            "group_lasso_mstep",
+            float(lambda_A_group_fraction)
+        ) not in completed_units
+    ]
+
+    skipped_lambdas = len(LAMBDA_A_GROUP_FRACTION_GRID) - len(pending_group_tasks)
+
+    if skipped_lambdas > 0:
+        print("\nSkipping completed group-lasso M-step fits:", skipped_lambdas)
+
+    if pending_group_tasks:
+        print(
+            "\nRunning",
+            len(pending_group_tasks),
+            "group-lasso M-step fits with",
+            min(N_WORKERS, len(pending_group_tasks)),
+            "worker threads."
         )
 
-        if unit_key in completed_units:
-            print(
-                "\nSkipping completed L1-M-step EM with lambda_A=",
-                lambda_A
-            )
-            continue
-
-        print("\n" + "-" * 100)
-        print(f"Fitting L1-M-step EM with lambda_A={lambda_A}")
-        print("-" * 100)
-
-        full_model = fit_l1_mstep_em_model(
-            y_obs=y_obs,
-            u=u,
-            C=C,
-            lambda_A=lambda_A,
-            random_seed=seed + 500
-        )
-
-        print("Full LL:", final_observed_log_likelihood(full_model))
-        print("EM iterations:", len(full_model.log_likelihoods))
-        print("Spectral radius:", full_model.spectral_radius())
-        print("Nonzero offdiag A:", full_model.count_nonzero_offdiag_A())
-        print("Nonzero total A:", full_model.count_nonzero_total_A())
-        print("Mean abs offdiag A:", full_model.mean_abs_offdiag_A())
-        print("Max abs offdiag A:", full_model.max_abs_offdiag_A())
-
-        if hasattr(full_model, "lasso_converged_history"):
-
-            if len(full_model.lasso_converged_history) > 0:
-                print("Lasso converged last:", full_model.lasso_converged_history[-1])
-                print("Lasso mean iterations last:", full_model.lasso_iterations_history[-1])
-                print("Lasso objective last:", full_model.lasso_objective_history[-1])
-
-        posterior = kalman_filter_and_rts_smoother(
-            y=y_obs,
-            u=u,
-            A_matrices=full_model.A_matrices,
-            B_matrices=full_model.B_matrices,
-            Q=full_model.Q,
-            C=C,
-            R=full_model.R
-        )
-
-        x_em_filtered = posterior["filtered_x"]
-        x_em_smoothed = posterior["smoothed_x"]
-
-        signal_specs = [
-            {
-                "signal_type": "em_filtered",
-                "signal": x_em_filtered
-            },
-            {
-                "signal_type": "em_smoothed",
-                "signal": x_em_smoothed
-            }
-        ]
-
-        for spec in signal_specs:
-
-            print("\nComputing network for:", spec["signal_type"], "lambda_A:", lambda_A)
-
-            network_df = compute_network_for_signal(
-                signal=spec["signal"],
-                u=u,
-                true_link_mask=true_link_mask,
-                signal_type=spec["signal_type"],
-                lambda_A=lambda_A,
-                outer_run=outer_run,
-                random_seed=seed,
-                x_true=x_true,
-                C_diagnostics=C_diagnostics,
-                full_model=full_model,
-                radius_true=data["radius_after"],
-                scale_factor=data["scale_factor"]
+        with ThreadPoolExecutor(
+                max_workers=min(N_WORKERS, len(pending_group_tasks))
+        ) as executor:
+            work_results = executor.map(
+                run_group_lasso_work_unit,
+                pending_group_tasks
             )
 
-            all_link_rows.append(
-                network_df
-            )
+            # executor.map yields in lambda-grid order. This preserves the
+            # reference row ordering while later fits run concurrently.
+            for (
+                    lambda_A_group_fraction,
+                    network_dfs,
+                    A_support_df
+            ) in work_results:
+                all_A_support_rows.append(A_support_df)
 
-            temp_summary = summarize_decision_rules(
-                network_df
-            )
+                for network_df in network_dfs:
+                    all_link_rows.append(network_df)
 
-            temp_display = temp_summary[
-                temp_summary["decision_rule"].isin([
-                    "debiased_chi_detected",
-                    "debiased_fdr_detected",
-                    "debiased_bic_detected",
-                    "debiased_D_gt_10p0_detected",
-                    "debiased_D_gt_15p0_detected",
-                    "debiased_D_gt_20p0_detected",
-                    "debiased_D_gt_25p0_detected"
-                ])
-            ]
-
-            print(
-                temp_display[
-                    [
-                        "signal_type",
-                        "lambda_A",
-                        "decision_rule",
-                        "fpr",
-                        "tpr",
-                        "precision",
-                        "f1",
-                        "tp",
-                        "fp",
-                        "tn",
-                        "fn"
+                    temp_summary = summarize_decision_rules(network_df)
+                    temp_display = temp_summary[
+                        temp_summary["decision_rule"].isin([
+                            "debiased_chi_detected",
+                            "debiased_fdr_detected",
+                            "debiased_bic_detected",
+                            "debiased_D_gt_8p0_detected",
+                            "debiased_D_gt_10p0_detected",
+                            "debiased_D_gt_15p0_detected",
+                            "debiased_D_gt_20p0_detected",
+                            "debiased_D_gt_25p0_detected"
+                        ])
                     ]
-                ].to_string(
-                    index=False
-                )
-            )
 
-        completed_units.add(
-            unit_key
-        )
-        save_checkpoint(
-            all_link_rows=all_link_rows,
-            all_true_link_tables=all_true_link_tables,
-            completed_units=completed_units,
-            true_link_outer_runs=true_link_outer_runs
-        )
+                    print(
+                        temp_display[
+                            [
+                                "signal_type",
+                                "lambda_A_group_fraction",
+                                "decision_rule",
+                                "fpr",
+                                "tpr",
+                                "precision",
+                                "f1",
+                                "tp",
+                                "fp",
+                                "tn",
+                                "fn"
+                            ]
+                        ].to_string(index=False)
+                    )
+
+                completed_units.add(
+                    (
+                        outer_run,
+                        "group_lasso_mstep",
+                        float(lambda_A_group_fraction)
+                    )
+                )
+
+                # Only this parent thread mutates restart state or files.
+                save_checkpoint(
+                    all_link_rows=all_link_rows,
+                    all_true_link_tables=all_true_link_tables,
+                    all_A_support_rows=all_A_support_rows,
+                    completed_units=completed_units,
+                    true_link_outer_runs=true_link_outer_runs
+                )
 
     # --------------------------------------------------
     # Save partial progress after each outer run
     # --------------------------------------------------
 
     os.makedirs(
-        "results",
+        RESULTS_DIR,
         exist_ok=True
     )
 
@@ -1778,7 +2132,10 @@ for outer_run in range(N_OUTER_RUNS):
     )
 
     partial_df.to_csv(
-        "results/experiment_32f_l1_mstep_sparse_a_em_results_partial.csv",
+        os.path.join(
+            RESULTS_DIR,
+            "experiment_32i_posterior_moment_group_lasso_fixed_covariance_results_partial.csv"
+        ),
         index=False
     )
 
@@ -1786,7 +2143,21 @@ for outer_run in range(N_OUTER_RUNS):
         all_true_link_tables,
         ignore_index=True
     ).to_csv(
-        "results/experiment_32f_l1_mstep_sparse_a_em_true_links_partial.csv",
+        os.path.join(
+            RESULTS_DIR,
+            "experiment_32i_posterior_moment_group_lasso_fixed_covariance_true_links_partial.csv"
+        ),
+        index=False
+    )
+
+    pd.concat(
+        all_A_support_rows,
+        ignore_index=True
+    ).to_csv(
+        os.path.join(
+            RESULTS_DIR,
+            "experiment_32i_posterior_moment_group_lasso_A_support_results_partial.csv"
+        ),
         index=False
     )
 
@@ -1807,6 +2178,11 @@ true_links_df = pd.concat(
     ignore_index=True
 )
 
+A_support_results_df = pd.concat(
+    all_A_support_rows,
+    ignore_index=True
+)
+
 link_strength_summary_df = summarize_link_strengths(
     results_df
 )
@@ -1815,14 +2191,18 @@ decision_summary_df = summarize_decision_rules(
     results_df
 )
 
+A_support_summary_df = summarize_A_support(
+    A_support_results_df
+)
+
 
 print("\n" + "=" * 160)
-print("Experiment 32F link-strength summary")
+print("Experiment 32I link-strength summary")
 print("=" * 160)
 
 link_strength_display_columns = [
     "signal_type",
-    "lambda_A",
+    "lambda_A_group_fraction",
     "true_link",
     "n_links",
 
@@ -1845,18 +2225,34 @@ link_strength_display_columns = [
     "mean_full_spectral_radius",
     "mean_full_em_iterations",
 
-    "mean_em_A_nonzero_offdiag",
-    "mean_em_A_nonzero_total",
+    "mean_em_A_nonzero_offdiag_coefficients",
+    "mean_em_A_nonzero_total_coefficients",
+    "mean_em_A_nonzero_offdiag_groups",
+    "mean_em_A_nonzero_total_groups",
+    "mean_em_A_mean_offdiag_group_norm",
+    "mean_em_A_median_offdiag_group_norm",
+    "mean_em_A_max_offdiag_group_norm",
     "mean_em_A_mean_abs_offdiag",
     "mean_em_A_max_abs_offdiag",
 
+    "mean_lambda_A_group_effective",
+    "median_lambda_A_group_effective",
+    "min_lambda_A_group_effective",
+    "max_lambda_A_group_effective",
+    "mean_moment_solver_condition_number",
+    "max_moment_solver_condition_number",
+
     "mean_full_Q_trace",
     "mean_full_R_trace",
+    "mean_fixed_Q_trace",
+    "mean_fixed_R_trace",
+    "mean_estimate_Q",
+    "mean_estimate_R",
     "mean_full_Q_offdiag_abs",
     "mean_full_R_offdiag_abs",
 
-    "mean_lasso_converged_last",
-    "mean_lasso_iterations_last"
+    "mean_group_solver_converged_last",
+    "mean_group_solver_iterations_last"
 ]
 
 available_link_strength_display_columns = [
@@ -1873,12 +2269,12 @@ print(
 
 
 print("\n" + "=" * 160)
-print("Experiment 32F decision-rule summary")
+print("Experiment 32I decision-rule summary")
 print("=" * 160)
 
 decision_display_columns = [
     "signal_type",
-    "lambda_A",
+    "lambda_A_group_fraction",
     "decision_rule",
     "fpr",
     "tpr",
@@ -1902,20 +2298,49 @@ print(
     )
 )
 
+print("\n" + "=" * 160)
+print("Experiment 32I fitted-A support summary")
+print("=" * 160)
+print(A_support_summary_df.to_string(index=False))
+
 
 # ------------------------------------------------------
 # Save outputs
 # ------------------------------------------------------
 
 os.makedirs(
-    "results",
+    RESULTS_DIR,
+    exist_ok=True
+)
+os.makedirs(
+    DATA_DIR,
     exist_ok=True
 )
 
-results_path = "results/experiment_32f_l1_mstep_sparse_a_em_results.csv"
-true_links_path = "results/experiment_32f_l1_mstep_sparse_a_em_true_links.csv"
-link_strength_summary_path = "results/experiment_32f_l1_mstep_sparse_a_em_link_strength_summary.csv"
-decision_summary_path = "results/experiment_32f_l1_mstep_sparse_a_em_decision_summary.csv"
+results_path = os.path.join(
+    RESULTS_DIR,
+    "experiment_32i_posterior_moment_group_lasso_fixed_covariance_results.csv"
+)
+true_links_path = os.path.join(
+    RESULTS_DIR,
+    "experiment_32i_posterior_moment_group_lasso_fixed_covariance_true_links.csv"
+)
+link_strength_summary_path = os.path.join(
+    RESULTS_DIR,
+    "experiment_32i_posterior_moment_group_lasso_fixed_covariance_link_strength_summary.csv"
+)
+decision_summary_path = os.path.join(
+    RESULTS_DIR,
+    "experiment_32i_posterior_moment_group_lasso_fixed_covariance_decision_summary.csv"
+)
+A_support_results_path = os.path.join(
+    RESULTS_DIR,
+    "experiment_32i_posterior_moment_group_lasso_A_support_results.csv"
+)
+A_support_summary_path = os.path.join(
+    DATA_DIR,
+    "experiment_32i_posterior_moment_group_lasso_A_support_summary.csv"
+)
 
 results_df.to_csv(
     results_path,
@@ -1937,6 +2362,16 @@ decision_summary_df.to_csv(
     index=False
 )
 
+A_support_results_df.to_csv(
+    A_support_results_path,
+    index=False
+)
+
+A_support_summary_df.to_csv(
+    A_support_summary_path,
+    index=False
+)
+
 # Remove restart checkpoints only after every final output is written.
 remove_checkpoint_files()
 
@@ -1952,16 +2387,22 @@ print(link_strength_summary_path)
 print("\nSaved decision summary to:")
 print(decision_summary_path)
 
+print("\nSaved fitted-A support results to:")
+print(A_support_results_path)
+
+print("\nSaved fitted-A support summary to:")
+print(A_support_summary_path)
+
 
 print("\nInterpretation guide")
 print("--------------------")
 print("oracle_latent: true latent state, best-case benchmark.")
 print("observed_y: noisy mixed observation used directly.")
 print("pinv_proxy: source proxy using known C pseudo-inverse.")
-print("em_filtered: causal filtered posterior mean from L1-M-step EM parameters.")
-print("em_smoothed: fixed-interval smoothed posterior mean from L1-M-step EM parameters.")
-print("lambda_A=0.00 is the no-L1 baseline under the same L1-M-step framework.")
-print("lambda_A>0 applies L1 sparsity only to off-diagonal endogenous A coefficients.")
-print("B coefficients are not L1-penalized because they explain exogenous/common input.")
-print("Check whether false-link deviance decreases faster than true-link deviance as lambda_A increases.")
-print("The key output columns are raw_deviance, full_bias_term, reduced_bias_term, debiased_deviance, FPR, TPR, precision, F1, and em_A_nonzero_offdiag.")
+print("em_filtered: causal filtered posterior mean from group-lasso EM parameters.")
+print("em_smoothed: fixed-interval smoothed posterior mean from group-lasso EM parameters.")
+print("lambda_A_group_fraction=0.00 is the no-group-penalty baseline.")
+print("Positive fractions scale each row's off-diagonal lag-group penalty by group lambda_max.")
+print("B coefficients are not group-penalized because they explain exogenous/common input.")
+print("Check whether false-link deviance decreases faster than true-link deviance as lambda_A_group_fraction increases.")
+print("The fitted-A support tables evaluate group norms separately from posterior-mean GC readout.")

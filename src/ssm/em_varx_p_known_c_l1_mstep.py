@@ -1,5 +1,12 @@
 import numpy as np
 
+try:
+    from numba import njit
+except ImportError:  # Preserve the reference implementation without Numba.
+    njit = None
+
+NUMBA_AVAILABLE = njit is not None
+
 from src.ssm.em_varx_p_known_c_shrinkage import (
     EMVARXPSSMKnownCConstrainedWarmStartShrinkage,
     shrink_covariance_matrix
@@ -17,6 +24,63 @@ def soft_threshold(
         return value + threshold
 
     return 0.0
+
+
+def _coordinate_descent_core_python(
+        X,
+        y,
+        l1_penalty,
+        ridge_penalty,
+        beta,
+        column_norms,
+        max_iter,
+        tol
+):
+    """Numerical core shared by the Python and Numba implementations."""
+
+    n_samples, n_features = X.shape
+    residual = y - X @ beta
+    converged = False
+
+    for iteration in range(max_iter):
+        max_delta = 0.0
+
+        for j in range(n_features):
+            old_value = beta[j]
+            residual += X[:, j] * old_value
+            rho_j = np.dot(X[:, j], residual) / n_samples
+            z_j = column_norms[j] + ridge_penalty[j]
+
+            if z_j <= 1e-12:
+                new_value = 0.0
+            elif rho_j > l1_penalty[j]:
+                new_value = (rho_j - l1_penalty[j]) / z_j
+            elif rho_j < -l1_penalty[j]:
+                new_value = (rho_j + l1_penalty[j]) / z_j
+            else:
+                new_value = 0.0
+
+            beta[j] = new_value
+            residual -= X[:, j] * new_value
+            delta = abs(new_value - old_value)
+
+            if delta > max_delta:
+                max_delta = delta
+
+        if max_delta < tol:
+            converged = True
+            break
+
+    return beta, residual, iteration + 1, converged
+
+
+if njit is not None:
+    _coordinate_descent_core = njit(
+        cache=True,
+        nogil=True
+    )(_coordinate_descent_core_python)
+else:
+    _coordinate_descent_core = _coordinate_descent_core_python
 
 
 def companion_spectral_radius_from_A(
@@ -103,6 +167,15 @@ def extract_smoothed_x(
         "state_smooth",
         "smoothed_state"
     ]
+
+    # kalman_smooth_varx_p_companion returns the RTS output under
+    # smooth_result["smoother"].  Unwrap that container while retaining
+    # compatibility with callers that pass the smoother output directly.
+    if (
+        isinstance(smooth_result, dict)
+        and "smoother" in smooth_result
+    ):
+        smooth_result = smooth_result["smoother"]
 
     if isinstance(smooth_result, dict):
         
@@ -303,58 +376,25 @@ def coordinate_descent_lasso_ridge(
 
         beta_work = beta_original * column_scale
 
-    residual = y - X_work @ beta_work
-
     column_norms = np.mean(
         X_work ** 2,
         axis=0
     )
 
-    converged = False
-
-    for iteration in range(max_iter):
-
-        max_delta = 0.0
-
-        for j in range(n_features):
-
-            old_value = beta_work[j]
-
-            residual += X_work[:, j] * old_value
-
-            rho_j = float(
-                np.dot(
-                    X_work[:, j],
-                    residual
-                ) / n_samples
-            )
-
-            z_j = float(
-                column_norms[j]
-                + ridge_penalty[j]
-            )
-
-            if z_j <= 1e-12:
-                new_value = 0.0
-            else:
-                new_value = soft_threshold(
-                    rho_j,
-                    l1_penalty[j]
-                ) / z_j
-
-            beta_work[j] = new_value
-
-            residual -= X_work[:, j] * new_value
-
-            max_delta = max(
-                max_delta,
-                abs(new_value - old_value)
-            )
-
-        if max_delta < tol:
-
-            converged = True
-            break
+    beta_work, residual, n_iterations, converged = (
+        _coordinate_descent_core(
+            # Coordinate descent repeatedly visits columns, so Fortran order
+            # makes each X[:, j] contiguous for both Numba and BLAS.
+            np.asfortranarray(X_work),
+            np.ascontiguousarray(y),
+            np.ascontiguousarray(l1_penalty),
+            np.ascontiguousarray(ridge_penalty),
+            np.ascontiguousarray(beta_work),
+            np.ascontiguousarray(column_norms),
+            int(max_iter),
+            float(tol)
+        )
+    )
 
     beta_original = beta_work / column_scale
 
@@ -378,7 +418,7 @@ def coordinate_descent_lasso_ridge(
         "beta": beta_original,
         "residual": final_residual,
         "objective": objective,
-        "n_iterations": iteration + 1,
+        "n_iterations": n_iterations,
         "converged": converged
     }
 
@@ -417,6 +457,7 @@ class EMVARXPSSMKnownCConstrainedWarmStartL1Mstep(
             lasso_tol=1e-6,
             stabilize_A=True,
             target_radius=0.98,
+            estimate_Q=True,
             **kwargs
     ):
         super().__init__(
@@ -466,6 +507,10 @@ class EMVARXPSSMKnownCConstrainedWarmStartL1Mstep(
 
         self.target_radius = float(
             target_radius
+        )
+
+        self.estimate_Q = bool(
+            estimate_Q
         )
 
         self.lasso_converged_history = []
@@ -820,26 +865,28 @@ class EMVARXPSSMKnownCConstrainedWarmStartL1Mstep(
 
             scale = 1.0
 
-        # Q update from state residuals.
-        Q_new = (
-            residual_matrix.T
-            @ residual_matrix
-            / max(
-                residual_matrix.shape[0],
-                1
+        # Optional Q update from state residuals.
+        if self.estimate_Q:
+
+            Q_new = (
+                residual_matrix.T
+                @ residual_matrix
+                / max(
+                    residual_matrix.shape[0],
+                    1
+                )
             )
-        )
 
-        Q_new = 0.5 * (
-            Q_new + Q_new.T
-        )
+            Q_new = 0.5 * (
+                Q_new + Q_new.T
+            )
 
-        self.Q = shrink_covariance_matrix(
-            S=Q_new,
-            alpha=self.alpha_Q,
-            target=self.shrinkage_target_Q,
-            covariance_floor=self.covariance_floor
-        )
+            self.Q = shrink_covariance_matrix(
+                S=Q_new,
+                alpha=self.alpha_Q,
+                target=self.shrinkage_target_Q,
+                covariance_floor=self.covariance_floor
+            )
 
         # R update from observation residuals.
         if self.estimate_R:

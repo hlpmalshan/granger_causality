@@ -132,6 +132,13 @@ EM fits, bootstrap replications, or Monte Carlo runs and may require
 substantial compute time. Some scripts include comments identifying reduced
 settings suitable for smoke tests.
 
+Long-running experiments should create an atomic restart checkpoint under
+`results/`. If a run is interrupted, launch the same experiment again with
+the same numerical settings and it will skip completed work units. The
+experiment rejects a checkpoint created with different settings rather than
+mixing incompatible results. Restart checkpoints are removed automatically
+only after all final outputs have been written successfully.
+
 Depending on the experiment, outputs are printed to the terminal or saved as
 PNG figures and CSV/XLSX summaries under `results/`. Existing result schemas
 and filenames form part of the reproducible experiment record.
