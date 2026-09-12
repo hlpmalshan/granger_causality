@@ -101,7 +101,14 @@ def work(task):
   row={**meta,"run_status":"failed","failure_rate":1.,"runtime_seconds":time.perf_counter()-start,"error_type":type(e).__name__,"error_message":str(e),"traceback":traceback.format_exc()};out["run"]=pd.DataFrame([row]);out["runtime"]=pd.DataFrame([row])
  return out
 
-def combine(t):return {k:(pd.concat(v,ignore_index=True) if v else pd.DataFrame()) for k,v in t.items()}
+WORK_KEYS=["stage","M_x","M_y","T","C_family","true_network_id","replicate_id"]
+ENTITY_KEYS={"source":["source_index"],"edge":["target","source"],"network":["score_type"],"spectral":["score_type","band_name"],"spectra":["parameter_source","score_type","target","source","band_name"],"deviance":["signal_type","score_type"],"uncertainty":["covariance_estimator","coefficient_global_index"],"selected":["coefficient_global_index"]}
+def combine(t):
+ out={}
+ for k,v in t.items():
+  f=pd.concat(v,ignore_index=True) if v else pd.DataFrame();subset=[x for x in WORK_KEYS+ENTITY_KEYS.get(k,[]) if x in f.columns]
+  out[k]=f.drop_duplicates(subset=subset,keep="last").reset_index(drop=True) if len(f) and subset else f
+ return out
 def metric_best(frame,score_type=None):
  if not len(frame):return {}
  g=frame if score_type is None else frame.loc[frame.score_type==score_type]
@@ -134,9 +141,11 @@ def choices(bp):
 def save(t):
  fr=combine(t)
  for k,name in RAW.items():atomic_csv(fr[k],os.path.join(RESULTS_DIR,name))
+ partial_names={"C":"C_diagnostics_partial.csv","latent":"latent_state_recovery_summary_partial.csv","A":"A_recovery_summary_partial.csv","B":"B_recovery_summary_partial.csv","Q":"Q_recovery_summary_partial.csv","network":"network_recovery_summary_partial.csv","spectra":"spectral_gc_summary_partial.csv","deviance":"deviance_diagnostics_partial.csv","runtime":"runtime_summary_partial.csv"}
+ for key,name in partial_names.items():atomic_csv(fr[key],os.path.join(RESULTS_DIR,name))
  bp=breakpoint(fr);dec=choices(bp);atomic_csv(bp,os.path.join(RESULTS_DIR,"breakpoint_summary_partial.csv"));atomic_csv(dec,os.path.join(RESULTS_DIR,"decision_summary_partial.csv"));return fr,bp,dec
 def execute(tasks,tables):
- old=combine(tables)["run"];done=set(zip(old.stage,old.M_x.astype(int),old.M_y.astype(int),old.C_family,old["T"].astype(int),old.true_network_id.astype(int),old.replicate_id.astype(int))) if len(old) else set();tasks=[x for x in tasks if x not in done]
+ old=combine(tables)["run"];done=set(zip(old.stage,old.M_x.astype(int),old.M_y.astype(int),old["T"].astype(int),old.C_family,old.true_network_id.astype(int),old.replicate_id.astype(int))) if len(old) else set();tasks=[x for x in tasks if x not in done]
  if not tasks:return
  p=Progress(len(tasks))
  with ProcessPoolExecutor(max_workers=min(WORKERS,len(tasks))) as pool:
@@ -159,7 +168,7 @@ def plots(bp,spectral,edge):
   for (family,band),q in g.groupby(["C_family","band_name"]):ax.plot(q.observation_ratio,q.AUPRC,marker="o",label=f"{family}:{band}")
   ax.set(xlabel="M_y / M_x",ylabel="spectral AUPRC");ax.legend(fontsize=6);fig.tight_layout();fig.savefig(os.path.join(path,"spectral_bands.png"));plt.close(fig)
  if len(edge):
-  true=edge.loc[edge.true_edge.astype(bool)];fig,ax=plt.subplots();ax.boxplot([true.loc[~true.missed_true_edge_indicator.astype(bool),"edge_observability_score_ij"],true.loc[true.missed_true_edge_indicator.astype(bool),"edge_observability_score_ij"]],labels=["detected","missed"]);ax.set_ylabel("edge observability");fig.tight_layout();fig.savefig(os.path.join(path,"edge_observability_detected_missed.png"));plt.close(fig)
+  true=edge.loc[edge.true_edge.astype(bool)];fig,ax=plt.subplots();ax.boxplot([true.loc[~true.missed_true_edge_indicator.astype(bool),"edge_observability_score_ij"],true.loc[true.missed_true_edge_indicator.astype(bool),"edge_observability_score_ij"]],tick_labels=["detected","missed"]);ax.set_ylabel("edge observability");fig.tight_layout();fig.savefig(os.path.join(path,"edge_observability_detected_missed.png"));plt.close(fig)
   q=true.copy();q["quartile"]=pd.qcut(q.edge_observability_score_ij,4,duplicates="drop");rate=q.groupby("quartile",observed=True).missed_true_edge_indicator.mean();fig,ax=plt.subplots();rate.plot.bar(ax=ax);ax.set_ylabel("missed true-edge rate");fig.tight_layout();fig.savefig(os.path.join(path,"missed_rate_observability_quartile.png"));plt.close(fig)
 def main():
  os.makedirs(RESULTS_DIR,exist_ok=True);config={"experiment":"34R_stage1_rectangular_C_breakpoint","M_x":20,"M_Y_GRID":MY_GRID,"C_FAMILY_LIST":FAMILIES,"T":1000,"N_TRUE_NETWORKS":2,"N_REPLICATES_PER_NETWORK":2,"N_FFBS_SAMPLES":50,"N_FREQS":128,"N_WORKERS":WORKERS,"smoke_test":SMOKE,"run_optional_M30":RUN_M30,"StageB":False};json.dump(config,open(os.path.join(RESULTS_DIR,"experiment_config.json"),"w"),indent=2);tables={k:[] for k in RAW}
@@ -171,7 +180,7 @@ def main():
    if len(f):tables[k].append(f)
  if SMOKE:execute([("stage0",10,8,300,"gaussian_isotropic",0,0)],tables)
  else:
-  execute([("stage1A",20,my,1000,fam,net,rep) for my in MY_GRID for fam in FAMILIES for net in range(2) for rep in range(2)],tables);_,bp,_=save(tables);base=bp.loc[(bp.M_x==20)&(bp.T==1000)];confirm=[]
+  execute([("stage1A",20,my,1000,fam,net,rep) for my in MY_GRID for fam in FAMILIES for net in range(2) for rep in range(2)],tables);_,bp,_=save(tables);base=bp.loc[(bp.M_x==20)&(bp["T"]==1000)];confirm=[]
   for regime in ("safe","transition","broken"):
    q=base.loc[base.regime_label==regime].sort_values("M_y")
    if len(q):z=q.iloc[-1] if regime=="safe" else q.iloc[0];confirm.append(("stage1B",20,int(z.M_y),2000,z.C_family,0,0))
