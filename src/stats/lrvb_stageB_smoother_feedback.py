@@ -1,5 +1,5 @@
 """Finite-difference Stage-B LRVB through the full Hybrid VB/smoother map."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import time
 
 import numpy as np
@@ -9,6 +9,7 @@ from src.ssm.ssm_varx_p_simulator import var_companion_spectral_radius
 from src.ssm.vb_ard_varx_ssm import HybridVBARDVARXSSMFixedBKnownC
 from src.ssm.vb_ard_varx_ssm_b_controls import HybridVBARDVARXSSMKnownCWithBControls
 from src.ssm.vb_ard_varx_ssm_bq_controls import HybridVBARDVARXSSMKnownCWithBQControls
+from src.ssm.vb_ard_varx_ssm_support_mask import HybridVBARDVARXSSMKnownCWithBQSupportMask
 
 
 def global_index(target, lag, source, n_states, na=2):
@@ -41,11 +42,17 @@ class PerturbedFitResult:
     final_loglikelihood: float
     runtime_seconds: float
     warning_flag: str
+    iteration_trace: list = field(default_factory=list)
+    theta_checkpoints: dict = field(default_factory=dict)
 
 
 def fit_perturbed_hybrid_vb(baseline_model, y, u, perturbation, max_iter=50,
                             convergence_tol=1e-4, min_iter=5,
-                            reestimate_B=None, reestimate_Q=None):
+                            reestimate_B=None, reestimate_Q=None,
+                            checkpoint_iterations=None,
+                            require_loglike_convergence=False,
+                            record_trace=False,
+                            iteration_callback=None):
     """Warm-start and reconverge Hybrid VB with a linear A perturbation.
 
     ``perturbation`` has shape (M, na*M) and enters the Gaussian A-update
@@ -70,7 +77,12 @@ def fit_perturbed_hybrid_vb(baseline_model, y, u, perturbation, max_iter=50,
         init_A_matrices=baseline_model.A_mean_matrices_, verbose=False,
         random_state=baseline_model.random_state)
     if reestimate_Q:
-        model = HybridVBARDVARXSSMKnownCWithBQControls(
+        model_class = (HybridVBARDVARXSSMKnownCWithBQSupportMask
+                       if hasattr(baseline_model, "candidate_mask")
+                       else HybridVBARDVARXSSMKnownCWithBQControls)
+        support_kwargs = ({"candidate_mask": baseline_model.candidate_mask}
+                          if hasattr(baseline_model, "candidate_mask") else {})
+        model = model_class(
             baseline_model.na, baseline_model.nb, baseline_model.C,
             baseline_model.Q, baseline_model.R, B_update_mode=B_update_mode,
             fixed_B_matrices=(baseline_model.B_matrices if not reestimate_B else None),
@@ -85,6 +97,7 @@ def fit_perturbed_hybrid_vb(baseline_model, y, u, perturbation, max_iter=50,
             include_A_posterior_uncertainty_in_Q=getattr(baseline_model, "include_A_posterior_uncertainty_in_Q", True),
             tol_Q_change=convergence_tol, initial_Q=baseline_model.Q,
             initial_alpha_mean=baseline_model.alpha_mean_, tol_alpha_change=convergence_tol,
+            **support_kwargs,
             **common)
     elif reestimate_B:
         model = HybridVBARDVARXSSMKnownCWithBControls(
@@ -106,6 +119,14 @@ def fit_perturbed_hybrid_vb(baseline_model, y, u, perturbation, max_iter=50,
     model.alpha_mean_ = np.asarray(baseline_model.alpha_mean_).copy()
     warning = ""; converged = False; started = time.perf_counter()
     A_change = alpha_change = B_change = Q_change = np.inf
+    checkpoint_iterations = set(int(value) for value in
+                                (checkpoint_iterations or ()))
+    record_trace = bool(record_trace or checkpoint_iterations or
+                        require_loglike_convergence)
+    iteration_trace = []
+    theta_checkpoints = {}
+    previous_loglike = None
+    previous_smoother_stat = None
     for iteration in range(int(max_iter)):
         smooth = model.smooth(y, u, A)
         stats = model._compute_posterior_sufficient_statistics(smooth, u)
@@ -128,8 +149,57 @@ def fit_perturbed_hybrid_vb(baseline_model, y, u, perturbation, max_iter=50,
         alpha_change = np.linalg.norm(model.alpha_mean_[mask] - old_alpha[mask]) / max(np.linalg.norm(old_alpha[mask]), 1e-12)
         B_change = np.linalg.norm(np.asarray(model.B_matrices)-old_B) / max(np.linalg.norm(old_B), 1e-12)
         Q_change = np.linalg.norm(model.Q-old_Q) / max(np.linalg.norm(old_Q), 1e-12)
-        if iteration + 1 >= min_iter and A_change < convergence_tol and alpha_change < convergence_tol and (not reestimate_B or B_change < convergence_tol) and (not reestimate_Q or Q_change < convergence_tol):
+        if record_trace:
+            # Evaluate likelihood under the updated parameters, matching the
+            # convergence semantics of the practical B/Q-controlled estimator.
+            updated_smooth = model.smooth(y, u, A)
+            loglike = float(updated_smooth["log_likelihood"])
+            loglike_change = (np.inf if previous_loglike is None else
+                              abs(loglike-previous_loglike) /
+                              max(abs(previous_loglike), 1.0))
+            smoother_stat = np.asarray(stats["S_zx"], float)
+            smoother_change = (np.inf if previous_smoother_stat is None else
+                               np.linalg.norm(smoother_stat-previous_smoother_stat) /
+                               max(np.linalg.norm(previous_smoother_stat), 1e-12))
+        else:
+            loglike = np.nan
+            loglike_change = np.inf
+            smoother_stat = None
+            smoother_change = np.nan
+        change_converged = (A_change < convergence_tol and
+                            alpha_change < convergence_tol and
+                            (not reestimate_B or B_change < convergence_tol) and
+                            (not reestimate_Q or Q_change < convergence_tol))
+        likelihood_converged = (loglike_change < convergence_tol)
+        convergence_flag = bool(iteration + 1 >= min_iter and
+                                change_converged and
+                                (likelihood_converged or
+                                 not require_loglike_convergence))
+        if record_trace:
+            iteration_trace.append({
+                "iteration": iteration + 1,
+                "observed_data_log_likelihood": loglike,
+                "relative_log_likelihood_change": float(loglike_change),
+                "relative_A_change": float(A_change),
+                "relative_B_change": float(B_change),
+                "relative_Q_change": float(Q_change),
+                "relative_alpha_change": float(alpha_change),
+                "smoother_statistic_change": float(smoother_change),
+                "parameter_change_converged": bool(change_converged),
+                "loglike_converged": bool(likelihood_converged),
+                "convergence_flag": convergence_flag,
+            })
+            if iteration_callback is not None:
+                iteration_callback(iteration_trace[-1])
+        if iteration + 1 in checkpoint_iterations:
+            theta_checkpoints[iteration + 1] = flatten_A(A).copy()
+        if record_trace:
+            previous_loglike = loglike
+            previous_smoother_stat = smoother_stat.copy()
+        if convergence_flag:
             converged = True; break
+    final_theta = flatten_A(A)
+    theta_checkpoints[iteration + 1] = final_theta.copy()
     model.smooth_result_ = model.smooth(y, u, A); model.n_iter_ = iteration + 1; model.converged_ = converged
     model.filtered_state_mean_ = model.smooth_result_["filter"]["x_filt"][:, :M]
     model.smoothed_state_mean_ = model.smooth_result_["smoother"]["x_smooth"][:, :M]
@@ -137,7 +207,7 @@ def fit_perturbed_hybrid_vb(baseline_model, y, u, perturbation, max_iter=50,
     return PerturbedFitResult(flatten_A(model.A_mean_matrices_), model, converged,
         iteration + 1, float(A_change), float(alpha_change), float(B_change), float(Q_change),
         float(model.smooth_result_["log_likelihood"]), time.perf_counter() - started,
-        warning)
+        warning, iteration_trace, theta_checkpoints)
 
 
 def sensitivity_column(baseline_model, y, u, direction_index, epsilon,
